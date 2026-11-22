@@ -18,6 +18,7 @@
 **لما تنزّل نسخة جديدة:** استبدل فولدر `FaceSorter` بس، وسيب `Library` زي ما هو.
 
 ### الاستخدام
+- **اللغة:** البرنامج بالعربي، وتقدر تغيّره لإنجليزي من زرار **🌐 English** اللي فوق.
 - **الجهاز ده:** تختار الصور والوضع (تعلم، أو تعلم + ترتيب، أو ترتيب بس)، وبعدين تراجع وتحفظ.
 - **مين ده؟:** تسحب صورة وتفلتها، فتعرف مين فيها، وتقدر تحفظ أي وش لاسم.
 - **المكتبة:** فيها الأشخاص، وتقدر تحدد أكتر من شخص وتسمّي أو تدمج أو تعزل أو تمسح أو تصدّر. وفيها كمان الجلسات والتراجع، والسجل، والنسخ الاحتياطية.
@@ -51,6 +52,7 @@ Free and open source (MIT license).
 **Updating:** replace only the `FaceSorter` folder; keep `Library`.
 
 ### Using it
+- **Language:** the window is in Arabic; switch it to English with the **🌐 English** button at the top.
 - **This computer:** choose photos and a mode (learn / learn + sort / sort only), then review and save.
 - **Who is this?:** drop a photo to see who is in it; save any face for a name.
 - **Library:**

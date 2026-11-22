@@ -18,6 +18,8 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from .i18n import tr
+
 APP_DIR = Path(__file__).resolve().parent.parent
 MODEL_DIR = APP_DIR / "models"
 MODELS = {
@@ -69,12 +71,13 @@ def ensure_models(log: Log = print) -> dict[str, Path]:
     for key, (name, url) in MODELS.items():
         path = MODEL_DIR / name
         if not path.exists() or path.stat().st_size < 100_000:
-            log(f"Downloading AI model {name} (first run only)...")
+            log(tr(f"Downloading AI model {name} (first run only)...", f"بنزّل نموذج {name} (أول مرة بس)..."))
             tmp = path.with_suffix(".part")
             urllib.request.urlretrieve(url, tmp)
             if tmp.stat().st_size < 100_000:
                 tmp.unlink(missing_ok=True)
-                raise RuntimeError(f"Download of {name} failed. Check your internet connection.")
+                raise RuntimeError(tr(f"Download of {name} failed. Check your internet connection.",
+                                      f"تنزيل {name} فشل. اتأكد من النت."))
             tmp.replace(path)
         paths[key] = path
     return paths

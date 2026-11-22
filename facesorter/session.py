@@ -22,18 +22,31 @@ from typing import Callable
 import numpy as np
 
 from .engine import Filters, cluster, encode_jpg, file_date, find_photos, read_photo, similarity_for
+from .i18n import person_label, tr
 from .library import Library, cache_pack, cache_unpack, copy_file, device_name
-from .perf import CORES, EnginePool, Throttle, set_low_priority, workers_for
+from .perf import CORES, EnginePool, Throttle, set_low_priority, speed_label, workers_for
 
 MODES = ("learn", "learn_sort", "sort")
-MODE_LABELS = {"learn": "Learn only | تعلم بس", "learn_sort": "Learn + sort | تعلم + ترتيب",
-               "sort": "Sort only | ترتيب بس"}
+
+
+def mode_label(mode: str) -> str:
+    return {"learn": tr("Learn only", "تعلم بس"), "learn_sort": tr("Learn + sort", "تعلم + ترتيب"),
+            "sort": tr("Sort only", "ترتيب بس")}[mode]
+
+
+
 SURE_MARGIN = 0.14       # score >= threshold + this: "sure"
 MAYBE_MARGIN = 0.02      # score >= threshold + this: "is this X?" (tuned on hard photos: v3.1)
 JOIN_MARGIN = 0.04       # joins an unknown person seen before
 BATCH = 24
-STAGES = {1: "Listing photos | حصر الصور", 2: "Finding faces | البحث عن الوشوش",
-          3: "Who is who | التعرف", 4: "Saving | الحفظ", 5: "Copying | النسخ"}
+
+
+def stage_label(stage: int) -> str:
+    return {1: tr("Listing photos", "حصر الصور"), 2: tr("Finding faces", "البحث عن الوشوش"),
+            3: tr("Who is who", "التعرف"), 4: tr("Saving", "الحفظ"), 5: tr("Copying", "النسخ")}.get(stage, "")
+
+
+
 OTHERS, NO_FACES = "Others", "No_faces"
 
 Log = Callable[[str], None]
@@ -61,7 +74,7 @@ def scan(lib: Library, folder: Path, filters: Filters | None = None, throttle: T
     folder is continued). Nothing is learned yet."""
     folder = Path(folder).resolve()
     if not folder.is_dir():
-        raise RuntimeError(f"Folder not found: {folder}")
+        raise RuntimeError(tr(f"Folder not found: {folder}", f"الفولدر مش موجود: {folder}"))
     filters = filters or Filters()
     throttle = throttle or Throttle()
     progress = progress or (lambda st, i, n: None)
@@ -71,7 +84,7 @@ def scan(lib: Library, folder: Path, filters: Filters | None = None, throttle: T
                              (device, str(folder))).fetchone()
         if row:
             sid = row[0]
-            log(f"Continuing the unfinished session {sid} for this folder.")
+            log(tr(f"Continuing the unfinished session {sid} for this folder.", f"بكمّل الجلسة {sid} اللي مخلصتش للفولدر ده."))
         else:
             sid = lib.db.execute("INSERT INTO sessions(started, device, folder, status) VALUES(?,?,?,?)",
                                  (_now(), device, str(folder), "scanning")).lastrowid
@@ -109,7 +122,8 @@ def scan(lib: Library, folder: Path, filters: Filters | None = None, throttle: T
                 todo.append((path, st.st_size, st.st_mtime))
         lib.db.commit()
         progress(1, len(files), len(files))
-        log(f"Stage 1: {s.files} photos, {len(todo)} to check, {s.known} checked before, {s.skipped} skipped.")
+        log(tr(f"Stage 1: {s.files} photos, {len(todo)} to check, {s.known} checked before, {s.skipped} skipped.",
+                f"المرحلة 1: {s.files} صورة، {len(todo)} هتتفحص، {s.known} اتفحصت قبل كده، {s.skipped} اتجاهلت."))
 
         # ---- stage 2: faces, in small saved batches, several at a time
         _find_faces(lib, sid, device, todo, filters, throttle, progress, log, s)
@@ -145,15 +159,17 @@ def _find_faces(lib, sid, device, todo, filters, throttle, progress, log, s: Sca
                 time.sleep(0.2)
             if throttle.stop.is_set():
                 s.stopped = True
-                log("Stopped. Everything finished so far is saved; start again to continue.")
+                log(tr("Stopped. Everything finished so far is saved; start again to continue.",
+                       "وقفت. كل اللي خلص اتحفظ، ودوس ابدأ تاني عشان تكمّل."))
                 break
             lvl = throttle.effective_level(time.monotonic())
             if lvl != level:
                 level = lvl
                 pool.resize(workers_for(lvl))
                 set_low_priority(lvl == "quiet")
-                note = " (on battery)" if throttle.on_battery and throttle.battery_saver else ""
-                log(f"Speed: {lvl}{note}, {workers_for(lvl)} photo(s) at a time.")
+                note = tr(" (on battery)", " (على البطارية)") if throttle.on_battery and throttle.battery_saver else ""
+                log(tr(f"Speed: {lvl}{note}, {workers_for(lvl)} photo(s) at a time.",
+                        f"السرعة: {speed_label(lvl)}{note}، {workers_for(lvl)} صورة في نفس الوقت."))
             for (path, size, mtime), sha1, date, skip, faces in ex.map(work, todo[start:start + BATCH]):
                 if sha1 is None:
                     s.unreadable += 1
@@ -181,7 +197,7 @@ def _find_faces(lib, sid, device, todo, filters, throttle, progress, log, s: Sca
                                (sid, sha1, str(path)))
             lib.db.commit()  # this batch is safe now
             progress(2, min(start + BATCH, len(todo)), len(todo))
-    log(f"Stage 2: {s.new} photos checked for faces.")
+    log(tr(f"Stage 2: {s.new} photos checked for faces.", f"المرحلة 2: {s.new} صورة اتفحصت."))
 
 
 # ====================================================================== review
@@ -345,7 +361,7 @@ def save_review(lib: Library, review: Review, mode: str, dest: Path | None = Non
     learn = mode in ("learn", "learn_sort")
     sort = mode in ("learn_sort", "sort")
     if sort and not dest:
-        raise RuntimeError("Choose where to put the sorted photos.")
+        raise RuntimeError(tr("Choose where to put the sorted photos.", "اختار هتحط الصور المرتبة فين."))
     progress = progress or (lambda st, i, n: None)
     faces = review.faces
     sid = review.session_id
@@ -430,19 +446,24 @@ def save_review(lib: Library, review: Review, mode: str, dest: Path | None = Non
                     progress(5, k, len(jobs))
             progress(5, len(jobs), len(jobs))
 
-        lines = [f"Computer: {review.device}", f"Folder: {review.folder}", f"Mode: {MODE_LABELS[mode]}",
-                 f"Photos: {len(review.photos)} · faces: {len(faces)}"]
+        lines = [tr(f"Computer: {review.device}", f"الجهاز: {review.device}"),
+                 tr(f"Folder: {review.folder}", f"الفولدر: {review.folder}"),
+                 tr(f"Mode: {mode_label(mode)}", f"الوضع: {mode_label(mode)}"),
+                 tr(f"Photos: {len(review.photos)} · faces: {len(faces)}", f"الصور: {len(review.photos)} · الوشوش: {len(faces)}")]
         if report["recognised"]:
-            lines.append("Recognised: " + ", ".join(f"{n} ({c})" for n, c in sorted(report["recognised"].items())))
+            lines.append(tr("Recognised: ", "اتعرف على: ")
+                         + ", ".join(f"{n} ({c})" for n, c in sorted(report["recognised"].items())))
         if report["named"]:
-            lines.append("New names: " + ", ".join(report["named"]))
+            lines.append(tr("New names: ", "أسامي جديدة: ") + ", ".join(report["named"]))
         if learn:
-            lines.append(f"Unknown people kept: {report['unknown']} · new face prints learned: {report['learned']}"
-                         f" · low-quality faces not learned: {report['unsure_skipped']}")
+            lines.append(tr(f"Unknown people kept: {report['unknown']} · new face prints learned: {report['learned']}"
+                            f" · low-quality faces not learned: {report['unsure_skipped']}",
+                            f"مجهولين اتحفظوا: {report['unknown']} · بصمات جديدة اتعلمت: {report['learned']}"
+                            f" · وشوش مش واضحة متعلمتش: {report['unsure_skipped']}"))
         else:
-            lines.append("The library was not changed (sort only).")
+            lines.append(tr("The library was not changed (sort only).", "المكتبة متغيرتش (ترتيب بس)."))
         if sort:
-            lines.append(f"Copied {copied} photos to {dest}")
+            lines.append(tr(f"Copied {copied} photos to {dest}", f"اتنسخت {copied} صورة في {dest}"))
         text = "\n".join(lines)
         lib.db.execute("UPDATE sessions SET status='saved', finished=?, mode=?, report=?, backup=? WHERE id=?",
                        (_now(), mode, text, str(backup) if backup else None, sid))
@@ -472,7 +493,7 @@ def identify(lib: Library, engine, path: Path) -> tuple[np.ndarray | None, list[
     path = Path(path)
     sha1, img, date = read_photo(path)
     if img is None:
-        raise RuntimeError(f"Cannot open this photo: {path.name}")
+        raise RuntimeError(tr(f"Cannot open this photo: {path.name}", f"مقدرتش أفتح الصورة دي: {path.name}"))
     out = []
     faces = engine.faces_in(img)
     if not faces:
@@ -487,7 +508,8 @@ def identify(lib: Library, engine, path: Path) -> tuple[np.ndarray | None, list[
             pid, sc = lib.match_groups(f.embedding[None, :], "unknown")[0]
             if pid is not None and sc >= base + JOIN_MARGIN:
                 p = lib.person(pid)
-                seen = f"{p.label} (seen {p.seen_count} times on {len(p.devices)} computer(s))" if p else None
+                seen = tr(f"{p.label} (seen {p.seen_count} times on {len(p.devices)} computer(s))",
+                          f"{person_label(p.label)} (اتشاف {p.seen_count} مرة على {len(p.devices)} جهاز)") if p else None
         out.append({"crop": f.crop, "box": f.box, "matches": best, "verdict": verdict, "good": f.good,
                     "seen_before": seen,
                     "face": {"emb": f.embedding, "crop": encode_jpg(f.crop), "quality": f.quality,

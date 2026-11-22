@@ -9,9 +9,15 @@ from contextlib import contextmanager
 import cv2
 
 from .engine import FaceEngine
+from .i18n import tr
 
 LEVELS = ("quiet", "balanced", "fast")
-LABELS = {"quiet": "🐢 Quiet | هادي", "balanced": "⚖️ Balanced | متوازن", "fast": "🚀 Fast | سريع"}
+
+
+def speed_label(level: str) -> str:
+    return {"quiet": tr("🐢 Quiet", "🐢 هادي"), "balanced": tr("⚖️ Balanced", "⚖️ متوازن"),
+            "fast": tr("🚀 Fast", "🚀 سريع")}[level]
+
 
 try:
     import psutil

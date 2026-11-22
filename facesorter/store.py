@@ -23,6 +23,8 @@ import secrets
 from datetime import date
 from pathlib import Path
 
+from .i18n import tr
+
 try:  # SQLCipher: same API as sqlite3, plus encryption
     import sqlcipher3 as sqlite
     HAS_CIPHER = True
@@ -127,13 +129,13 @@ def unlock(db: Path, secret: str) -> bytes:
     """The master key from the password or the recovery key. Raises LockedError."""
     kp = key_path(db)
     if not kp.exists():
-        raise LockedError("The key file (.key) next to the library is missing.")
+        raise LockedError(tr("The key file (.key) next to the library is missing.", "ملف المفتاح (.key) اللي جنب المكتبة مش موجود."))
     payload = json.loads(kp.read_text(encoding="utf-8"))
     for slot, s in (("password", secret), ("recovery", secret.upper())):
         master = _unwrap(payload[slot], s)
         if master is not None:
             return master
-    raise LockedError("Wrong password.")
+    raise LockedError(tr("Wrong password.", "الباسورد غلط."))
 
 
 # ---------------------------------------------------------------- connect
@@ -145,13 +147,14 @@ def connect(db: Path, master: bytes | None = None):
     conn = sqlite.connect(str(db), check_same_thread=False)
     if master:
         if not HAS_CIPHER:
-            raise LockedError("This copy of the program cannot open password-protected libraries.")
+            raise LockedError(tr("This copy of the program cannot open password-protected libraries.",
+                                 "النسخة دي من البرنامج مش بتقدر تفتح مكتبات عليها باسورد."))
         conn.execute(f"PRAGMA key = \"{_key_sql(master)}\"")
     try:
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except DatabaseError as e:
         conn.close()
-        raise LockedError("Wrong password or damaged library file.") from e
+        raise LockedError(tr("Wrong password or damaged library file.", "الباسورد غلط أو ملف المكتبة بايظ.")) from e
     conn.execute("PRAGMA journal_mode=DELETE")
     return conn
 

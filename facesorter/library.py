@@ -35,6 +35,7 @@ from typing import Callable
 import numpy as np
 
 from .engine import APP_DIR, cluster, decode_jpg, top_k_mean
+from .i18n import person_label, tr
 from . import store
 from .store import LockedError, MultipleLibrariesError  # noqa: F401  (re-exported for the window)
 
@@ -125,7 +126,7 @@ class Library:
             raise MultipleLibrariesError(files)
         if not files:
             if not create:
-                raise FileNotFoundError(f"No library in {self.folder}")
+                raise FileNotFoundError(tr(f"No library in {self.folder}", f"مفيش مكتبة في {self.folder}"))
             self.folder.mkdir(parents=True, exist_ok=True)
             files = [self.folder / store.dated_name(store.today(), store.today())]
         self.path = files[0].resolve()
@@ -133,7 +134,7 @@ class Library:
         self.master: bytes | None = None
         if self.path.exists() and store.is_encrypted(self.path):
             if not password:
-                raise LockedError("This library has a password.")
+                raise LockedError(tr("This library has a password.", "المكتبة دي عليها باسورد."))
             self.master = store.unlock(self.path, password)
         self.db = store.connect(self.path, self.master)
         self.db.executescript(SCHEMA)
@@ -234,17 +235,17 @@ class Library:
             shutil.copy2(backup, self.path)
             self.db = store.connect(self.path, self.master)
             self._known = None
-            self.log("history", f"Library restored from backup {Path(backup).name}")
+            self.log("history", tr(f"Library restored from backup {Path(backup).name}", f"المكتبة رجعت من النسخة {Path(backup).name}"))
 
     # ------------------------------------------------------------- password
     def set_password(self, password: str) -> str:
         """Lock the library with a password. Returns the recovery key (show it once!)."""
         with self.lock:
             if not store.HAS_CIPHER:
-                raise RuntimeError("This copy of the program cannot encrypt libraries.")
+                raise RuntimeError(tr("This copy of the program cannot encrypt libraries.", "النسخة دي من البرنامج مش بتقدر تشفّر المكتبات."))
             if self.master:
                 store.rewrap_password(self.path, self.master, password)
-                self.log("history", "Password changed")
+                self.log("history", tr("Password changed", "الباسورد اتغير"))
                 return ""
             master = os.urandom(32)
             recovery = store.new_recovery_key()
@@ -256,7 +257,7 @@ class Library:
             os.replace(tmp, self.path)
             self.master = master
             self.db = store.connect(self.path, self.master)
-            self.log("history", "Password set: the library is now encrypted")
+            self.log("history", tr("Password set: the library is now encrypted", "اتحط باسورد: المكتبة بقت متشفرة"))
             return recovery
 
     def remove_password(self) -> None:
@@ -271,7 +272,7 @@ class Library:
             store.key_path(self.path).unlink(missing_ok=True)
             self.master = None
             self.db = store.connect(self.path, None)
-            self.log("history", "Password removed: the library is no longer encrypted")
+            self.log("history", tr("Password removed: the library is no longer encrypted", "الباسورد اتشال: المكتبة مبقتش متشفرة"))
 
     def _reencrypt_backups(self, old: bytes | None, new: bytes | None) -> None:
         for b in self.backups():
@@ -444,7 +445,7 @@ class Library:
         pid = self.person_by_name(name)
         if pid is None:
             pid = self.new_person(name.strip(), "known")
-            self.log("memory", f"New person '{name.strip()}'")
+            self.log("memory", tr(f"New person '{name.strip()}'", f"شخص جديد '{name.strip()}'"))
         return pid
 
     def add_prints(self, pid: int | None, faces: list[dict], source: str, session_id: int | None = None) -> int:
@@ -553,7 +554,8 @@ class Library:
                 return ""
             n = self.db.execute("DELETE FROM prints WHERE person_id=?", (pid,)).rowcount
             self.db.execute("DELETE FROM people WHERE id=?", (pid,))
-            msg = f"Deleted '{row[0] or f'Unknown_{pid:04d}'}' ({n} faces)"
+            who = row[0] or person_label(f"Unknown_{pid:04d}")
+            msg = tr(f"Deleted '{who}' ({n} faces)", f"اتمسح '{who}' ({n} وش)")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -594,7 +596,7 @@ class Library:
                 n = self.db.execute("DELETE FROM prints WHERE source='auto' AND person_id=?", (pid,)).rowcount
             else:
                 n = self.db.execute("DELETE FROM prints WHERE source='auto'").rowcount
-            self.log("memory", f"Reset automatic learning ({n} faces)")
+            self.log("memory", tr(f"Reset automatic learning ({n} faces)", f"اتمسح التعلم التلقائي ({n} وش)"))
             self.changed()
             return n
 
@@ -644,7 +646,7 @@ class Library:
         with self.lock:
             row = self.last_saved_session()
             if not row or not row[1] or not Path(row[1]).exists():
-                return "Nothing to undo."
+                return tr("Nothing to undo.", "مفيش حاجة تتلغي.")
             sid, backup, _ = row
             sessions_after = self.db.execute("SELECT id, started, finished, device, folder, mode, report "
                                              "FROM sessions WHERE id>=?", (sid,)).fetchall()
@@ -655,7 +657,8 @@ class Library:
                                 "report) VALUES(?,?,?,?,?,?,?,?)",
                                 (s_id, started, finished, device, folder, mode, "undone", report))
             self.db.commit()
-            msg = f"Session {sid} was undone; the library is back as it was before it."
+            msg = tr(f"Session {sid} was undone; the library is back as it was before it.",
+                     f"الجلسة {sid} اتلغت، والمكتبة رجعت زي ما كانت قبلها.")
             self.log("history", msg)
             return msg
 
@@ -668,7 +671,8 @@ class Library:
             pid = self.person_for_name(name)
             n = self.add_prints(pid, [face], "manual")
             self.note_seen(pid, 1, face.get("device") or device_name())
-            msg = f"Face saved for '{name}'" if n else f"'{name}' already has this face"
+            msg = (tr(f"Face saved for '{name}'", f"الوش اتحفظ لـ '{name}'") if n
+                   else tr(f"'{name}' already has this face", f"'{name}' عنده الوش ده أصلاً"))
             self.log("memory", msg)
             self.changed()
             return msg
@@ -689,7 +693,7 @@ class Library:
                 done.append(row[0])
             if not done:
                 return ""
-            msg = "Isolated (back to unknown, to be named again): " + ", ".join(done)
+            msg = tr("Isolated (back to unknown, to be named again): ", "اتعزلوا (رجعوا للمجهولين عشان يتسمّوا تاني): ") + ", ".join(done)
             self.log("memory", msg)
             self.changed()
             return msg
@@ -718,7 +722,7 @@ class Library:
             dest_folder = Path(dest_folder)
             dest_folder.mkdir(parents=True, exist_ok=True)
             if store.find_libraries(dest_folder):
-                raise RuntimeError(f"There is already a library in {dest_folder}")
+                raise RuntimeError(tr(f"There is already a library in {dest_folder}", f"فيه مكتبة موجودة في {dest_folder}"))
             out = Library(dest_folder)
             for pid in pids:
                 row = self.db.execute("SELECT name, kind, created, last_seen, seen_count, devices, note FROM people "
@@ -731,11 +735,12 @@ class Library:
                                        "FROM prints WHERE person_id=?", (pid,)).fetchall()
                 out.db.executemany("INSERT INTO prints(person_id, emb, crop, quality, source, photo_key, photo_date, "
                                    "device, added) VALUES(?,?,?,?,?,?,?,?,?)", [(new_id, *r) for r in rows])
-            out.log("history", f"Created by exporting {len(pids)} people from {self.path.name}")
+            out.log("history", tr(f"Created by exporting {len(pids)} people from {self.path.name}",
+                                     f"اتعملت بتصدير {len(pids)} شخص من {self.path.name}"))
             out.db.commit()
             path = out.path
             out.close()
-            self.log("history", f"Exported {len(pids)} people to {path}")
+            self.log("history", tr(f"Exported {len(pids)} people to {path}", f"اتصدّر {len(pids)} شخص لـ {path}"))
             return path
 
     def merge_from(self, other: Path, password: str | None = None) -> str:
@@ -746,7 +751,7 @@ class Library:
                                                                                           create=False)
             if o.path == self.path:
                 o.close()
-                raise RuntimeError("That is this library.")
+                raise RuntimeError(tr("That is this library.", "دي نفس المكتبة المفتوحة."))
             self.backup("before_merge")
             try:
                 people = added = 0
@@ -781,7 +786,8 @@ class Library:
                                     o.db.execute("SELECT sha1, date, status, faces FROM photo_cache").fetchall())
                 self.db.executemany("INSERT OR IGNORE INTO seen(device, path, size, mtime, sha1) VALUES(?,?,?,?,?)",
                                     o.db.execute("SELECT device, path, size, mtime, sha1 FROM seen").fetchall())
-                msg = f"Merged {o.path.name}: {people} new people, {added} faces added"
+                msg = tr(f"Merged {o.path.name}: {people} new people, {added} faces added",
+                         f"اتدمجت {o.path.name}: {people} شخص جديد، و{added} وش اتضاف")
             finally:
                 o.close()
             self.log("history", msg)
@@ -798,7 +804,7 @@ class Library:
             store.export_to(self.db, dst, self.master)
             if self.master:
                 shutil.copy2(store.key_path(self.path), store.key_path(dst))
-            self.log("history", f"Copy saved to {folder}")
+            self.log("history", tr(f"Copy saved to {folder}", f"نسخة اتحفظت في {folder}"))
             return folder
 
     def move_to(self, dest_folder: Path) -> Path:
@@ -809,7 +815,7 @@ class Library:
                 return self.folder
             dest_folder.mkdir(parents=True, exist_ok=True)
             if store.find_libraries(dest_folder):
-                raise RuntimeError(f"There is already a library in {dest_folder}")
+                raise RuntimeError(tr(f"There is already a library in {dest_folder}", f"فيه مكتبة موجودة في {dest_folder}"))
             dst = dest_folder / self.path.name
             store.export_to(self.db, dst, self.master)
             if self.master:
@@ -829,7 +835,7 @@ class Library:
                 pass
             self.path, self.folder = dst, dest_folder
             self.db = store.connect(self.path, self.master)
-            self.log("history", f"Library moved from {old_folder} to {dest_folder}")
+            self.log("history", tr(f"Library moved from {old_folder} to {dest_folder}", f"المكتبة اتنقلت من {old_folder} لـ {dest_folder}"))
             return dest_folder
 
     def size_info(self) -> dict:
@@ -862,7 +868,8 @@ class Library:
             self.db.commit()
             self.db.execute("VACUUM")
             freed = max(0, before - self.path.stat().st_size) / (1024 * 1024)
-            msg = f"Cleaned: forgot the scan results of {n} photos, freed {freed:.1f} MB"
+            msg = tr(f"Cleaned: forgot the scan results of {n} photos, freed {freed:.1f} MB",
+                     f"اتنضّفت: اتمسحت نتايج فحص {n} صورة، وفضيت {freed:.1f} ميجا")
             self.log("history", msg)
             self.changed()
             return msg

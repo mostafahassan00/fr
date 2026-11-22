@@ -35,10 +35,27 @@ import sys, time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 photos, W, H = Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+import traceback
 from facesorter import gui, session
+found = []
+
+def no_popup(*args, **kw):  # a popup would wait forever on the test machine: note it and go on
+    found.append("popup: " + " / ".join(str(a) for a in args))
+    print("POPUP", args, flush=True)
+    return None
+for name in ("showinfo", "showwarning", "showerror", "askyesno", "askyesnocancel", "askokcancel"):
+    setattr(gui.messagebox, name, no_popup)
+gui.simpledialog.askstring = no_popup
+gui.choose = no_popup
+
+def on_error(exc, val, tb):
+    found.append("error: " + "".join(traceback.format_exception(exc, val, tb)))
+    print("ERROR", "".join(traceback.format_exception(exc, val, tb)), flush=True)
+    r.destroy()
+gui.App.on_error = lambda self, exc, val, tb: on_error(exc, val, tb)
 app = gui.App()
 r = app.root
-found = []
+r.after(240000, lambda: (found.append("timeout: the test took too long"), r.destroy()))
 
 def settle():
     for _ in range(10):
@@ -49,7 +66,7 @@ def check(name, win):
     settle()
     for p in gui.layout_problems(win):
         found.append(f"{name}: {p}")
-    print(f"  {name}: checked")
+    print(f"  {name}: checked", flush=True)
 
 def steps():
     r.state("normal")
@@ -82,7 +99,12 @@ def steps():
         check("after switching language: " + app.nb.tab(tab, "text").strip(), r)
     r.destroy()
 
-r.after(800, steps)
+def safe_steps():
+    try:
+        steps()
+    except Exception:
+        on_error(*sys.exc_info())
+r.after(800, safe_steps)
 r.mainloop()
 for p in found:
     print("PROBLEM", p)
@@ -95,10 +117,17 @@ for lang in ("ar", "en"):
         lib = work / f"lib_{lang}_{scale}"
         env = dict(os.environ, FACE_SORTER_LIBRARY=str(lib), FACE_SORTER_LANGUAGE=lang, FACE_SORTER_UI_SCALE=scale)
         print(f"== {lang} at {float(scale):.0%}, 1024x700")
-        out = subprocess.run([str(py), "-c", CHILD, str(app_dir), str(photos), "1024", "700"], capture_output=True,
-                             text=True, encoding="utf-8", errors="replace", env=env, timeout=600)
-        print(out.stdout[-6000:], out.stderr[-3000:])
-        if "LAYOUT OK" not in out.stdout:
+        print("   starting...", flush=True)
+        try:
+            out = subprocess.run([str(py), "-c", CHILD, str(app_dir), str(photos), "1024", "700"],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+                                 timeout=300)
+            stdout, stderr = out.stdout, out.stderr
+        except subprocess.TimeoutExpired as e:
+            stdout = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+            stderr = "TIMEOUT: the window did not finish in 5 minutes"
+        print(stdout[-6000:], stderr[-3000:], flush=True)
+        if "LAYOUT OK" not in stdout:
             failed = True
 settings = app_dir.parent / "settings.json"
 if settings.exists():

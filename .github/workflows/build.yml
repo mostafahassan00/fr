@@ -1,0 +1,93 @@
+name: Build portable Face Sorter (Windows)
+
+# Builds FaceSorter_vX.Y_windows.zip: the program with its own Python, libraries and AI models,
+# so it runs from a USB stick on any Windows 10/11 (64-bit) without installing anything.
+# The build is tested on a clean Windows machine before it is published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Make the portable folder
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path facesorter/__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $pyhome = Split-Path (Get-Command python).Source
+          New-Item -ItemType Directory -Force dist/FaceSorter/app/models, dist/Library | Out-Null
+
+          # Python of its own (a normal CPython folder can be moved anywhere on Windows)
+          Copy-Item -Recurse $pyhome dist/FaceSorter/python
+          dist/FaceSorter/python/python.exe -m pip install --no-warn-script-location --no-cache-dir -r requirements.txt
+          foreach ($d in "Lib/test", "Lib/idlelib", "Lib/ensurepip", "Lib/lib2to3", "Lib/site-packages/pip",
+                         "Scripts", "include", "libs", "Doc", "tcl/tix8.4.3") {
+            Remove-Item -Recurse -Force "dist/FaceSorter/python/$d" -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem -Recurse -Directory -Filter __pycache__ dist/FaceSorter/python | Remove-Item -Recurse -Force
+
+          # the program and its AI models (no internet needed later)
+          Copy-Item face_sorter.py dist/FaceSorter/app/
+          Copy-Item -Recurse facesorter dist/FaceSorter/app/facesorter
+          Invoke-WebRequest https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx -OutFile dist/FaceSorter/app/models/face_detection_yunet_2023mar.onnx
+          Invoke-WebRequest https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx -OutFile dist/FaceSorter/app/models/face_recognition_sface_2021dec.onnx
+          Copy-Item build/FaceSorter.bat dist/FaceSorter/
+          Copy-Item build/Library_README.txt dist/Library/README.txt
+          Copy-Item README.md, CHANGELOG.md, LICENSE, THIRD_PARTY_LICENSES.md dist/
+
+          $mb = [math]::Round((Get-ChildItem -Recurse dist | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host "Portable folder: $mb MB"
+
+      - name: Test it like a new computer (no system Python)
+        shell: pwsh
+        run: |
+          # NASA photo (public domain), shipped with scikit-image for tests
+          Invoke-WebRequest https://raw.githubusercontent.com/scikit-image/scikit-image/v0.24.0/skimage/data/astronaut.png -OutFile sample.png
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
+          dist/FaceSorter/python/python.exe build/selftest.py dist sample.png
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (Test-Path dist/Library/library.db) { Remove-Item dist/Library/library.db }
+          if (Test-Path dist/FaceSorter/settings.json) { Remove-Item dist/FaceSorter/settings.json }
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath "FaceSorter_v$($env:VERSION)_windows.zip"
+          $mb = [math]::Round((Get-Item "FaceSorter_v$($env:VERSION)_windows.zip").Length / 1MB)
+          Write-Host "Zip: $mb MB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FaceSorter_v${{ env.VERSION }}_windows
+          path: FaceSorter_v${{ env.VERSION }}_windows.zip
+          retention-days: 30
+
+      - name: Publish as a GitHub release (main only)
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$($env:VERSION)"
+          $zip = "FaceSorter_v$($env:VERSION)_windows.zip"
+          $exists = $true
+          try { gh release view $tag *> $null; if ($LASTEXITCODE -ne 0) { $exists = $false } } catch { $exists = $false }
+          if ($exists) {
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --target $env:GITHUB_SHA --title "Face Sorter $tag" --notes-file CHANGELOG.md
+          }

@@ -19,13 +19,12 @@
 
 ### الاستخدام
 - **اللغة:** البرنامج بالعربي، وتقدر تغيّره لإنجليزي من زرار **🌐 English** اللي فوق.
-- **الجهاز ده:** تختار الصور والوضع (تعلم، أو تعلم + ترتيب، أو ترتيب بس)، وبعدين تراجع وتحفظ.
-- **مين ده؟:** تسحب صورة وتفلتها، فتعرف مين فيها، وتقدر تحفظ أي وش لاسم.
-- **المكتبة:** فيها الأشخاص، وتقدر تحدد أكتر من شخص وتسمّي أو تدمج أو تعزل أو تمسح أو تصدّر. وفيها كمان الجلسات والتراجع، والسجل، والنسخ الاحتياطية.
-- **بطاقة المكتبة** (فوق):
-  - المسار والتاريخ والحجم.
-  - نسخة، ونقل، وفتح مكتبة تانية، والرجوع للافتراضية.
-  - 🔒 الباسورد، و**نضّف**.
+الصفحات في القائمة الجانبية (Ctrl+1 لحد Ctrl+5):
+- **🖥 الجهاز ده:** تختار فولدر الصور والوضع (تعلم، أو تعلم + ترتيب، أو ترتيب بس)، وبعدين تراجع وتحفظ. صور الآيفون (HEIC) بتتقري كمان.
+- **🔍 مين ده؟:** تسحب صورة وتفلتها، فتعرف مين فيها، وتقدر تحفظ أي وش لاسم.
+- **🔎 دوّر:** تختار شخص أو أكتر، فيطلعلك كل الصور اللي على الجهاز وهما فيها مع بعض.
+- **👥 الناس:** كل اللي المكتبة تعرفهم. تقدر تسمّي، أو تدمج، أو تعزل، أو تمسح، أو تصدّر، أو تصلّح الوشوش.
+- **📚 المكتبة:** الملف (نسخة، ونقل، وفتح مكتبة تانية)، و🔒 الباسورد، والمساحة و**نضّف**، والجلسات والتراجع، والسجل، والنسخ الاحتياطية.
 
 ### الخصوصية والمسؤولية
 - المكتبة فيها **بيانات وشوش وأسامي**، ودي بيانات حساسة.
@@ -53,15 +52,12 @@ Free and open source (MIT license).
 
 ### Using it
 - **Language:** the window is in Arabic; switch it to English with the **🌐 English** button at the top.
-- **This computer:** choose photos and a mode (learn / learn + sort / sort only), then review and save.
-- **Who is this?:** drop a photo to see who is in it; save any face for a name.
-- **Library:**
-  - Select several people to name, join, isolate, delete or export them.
-  - Also: sessions and undo, the log, and backups.
-- **Library card** (top):
-  - Path, dates and size.
-  - Save a copy, move, open another library, or go back to the default one.
-  - 🔒 password, and **Clean**.
+Pages in the side menu (Ctrl+1 … Ctrl+5):
+- **🖥 This computer:** choose a photos folder and a mode (learn / learn + sort / sort only), then review and save. iPhone photos (HEIC) are read too.
+- **🔍 Who is this?:** drop a photo to see who is in it; save any face for a name.
+- **🔎 Find:** choose one person or more to get every photo on this computer with all of them in it.
+- **👥 People:** everyone the library knows: name, join, isolate, delete, export, or correct faces.
+- **📚 Library:** the file (copy, move, open another), 🔒 password, space and **Clean**, sessions and undo, log, backups.
 
 ### Privacy and responsibility
 - The library holds **face data and names**, which are sensitive.
@@ -73,5 +69,7 @@ Free and open source (MIT license).
 
 ### Build / develop
 - `python face_sorter.py` opens the window. `python face_sorter.py --help` lists the command-line tools.
+- `python face_sorter.py accuracy <folder>` measures recognition on your own photos (one folder per person).
+- `python -m unittest discover -s tests` runs the library tests.
 - GitHub Actions builds the portable Windows zip and tests it on a clean Windows machine (`.github/workflows/build.yml`).
 - Third-party licenses: `THIRD_PARTY_LICENSES.md`.

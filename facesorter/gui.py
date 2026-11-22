@@ -1,12 +1,22 @@
-"""The window (Tkinter): the library card, the "This computer", "Who is this?" and "Library" tabs,
-and the review window.
+"""The window (Tkinter).
 
-One language at a time (Arabic by default, English from the language button), laid out from the
-right in Arabic. Rows of buttons wrap onto a new line instead of hiding what does not fit.
+    ┌──────────┬───────────────────────────────────────────────┐
+    │ side     │ the library: name, folder, numbers   🌐  ⚙    │
+    │ menu     ├───────────────────────────────────────────────┤
+    │ 🖥 scan   │ the page: a title, then white cards           │
+    │ 🔍 who    │                                               │
+    │ 🔎 find   │                                               │
+    │ 👥 people │                                               │
+    │ 📚 library├───────────────────────────────────────────────┤
+    │          │ status: the result of the last thing you did  │
+    └──────────┴───────────────────────────────────────────────┘
+
+One language at a time (Arabic by default, laid out from the right; English from the 🌐 button).
+Rows of buttons wrap onto a new line instead of hiding what does not fit; the side menu shrinks
+to icons on narrow windows. The review window opens after a scan.
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import queue
@@ -14,7 +24,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import tkinter.font as tkfont
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -24,12 +33,15 @@ import cv2
 import numpy as np
 
 from . import __version__
-from .engine import FaceEngine, Filters, decode_jpg
+from .engine import HEIF_EXTS, FaceEngine, Filters, read_heif
 from .i18n import LANGUAGES, language, person_label, rtl, set_language, tr
-from .library import _ROOT, LIBRARY_DIR, Library, LockedError, MultipleLibrariesError, device_name
+from .library import _ROOT, LIBRARY_DIR, Library, LockedError, MultipleLibrariesError, copy_file, device_name
 from .perf import LEVELS, Throttle, psutil, speed_label
-from .session import (MODES, build_review, discard_session, identify, mode_label, pending_session, save_review,
-                      scan, stage_label)
+from .session import (MODES, build_review, discard_session, find_people, identify, mode_label, pending_session,
+                      save_review, scan, stage_label)
+from .ui_kit import (C, LEVEL_COLORS, VERDICT_COLORS, Card, Flow, Fonts, Grid, ScrollFrame, SearchBox, Tip,
+                     WrapLabel, anchor, app_icon, chip, choose, end, fit_window, justify, layout_problems, menu_button,
+                     photo_from_array, round_thumb, shorten_middle, start, style_tk, theme)
 
 try:  # drag and drop of files onto the window
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -37,11 +49,20 @@ except Exception:  # pragma: no cover - the portable build has it
     TkinterDnD = None
     DND_FILES = None
 
+__all__ = ["App", "ReviewWindow", "main", "layout_problems", "Filters", "messagebox", "simpledialog", "choose"]
+
 SETTINGS = _ROOT / "settings.json"
 ERRORS = _ROOT / "errors.txt"
-VERDICT_COLORS = {"sure": "#2c2", "maybe": "#e90", "unknown": "#999"}
-LEVEL_COLORS = {"weak": "#c33", "medium": "#c80", "strong": "#2a2"}
-CELL = 96
+PAGES = ("scan", "who", "find", "people", "library")
+FIND_LIMIT = 600      # photos shown by "find" (the copy button still takes all of them)
+
+
+def page_names() -> dict[str, tuple[str, str]]:
+    return {"scan": ("🖥", tr("This computer", "الجهاز ده")),
+            "who": ("🔍", tr("Who is this?", "مين ده؟")),
+            "find": ("🔎", tr("Find", "دوّر")),
+            "people": ("👥", tr("People", "الناس")),
+            "library": ("📚", tr("Library", "المكتبة"))}
 
 
 def section_label(section: str) -> str:
@@ -50,46 +71,21 @@ def section_label(section: str) -> str:
 
 
 def level_text(level: str) -> str:
-    return {"weak": tr("weak", "ضعيف"), "medium": tr("medium", "متوسط"), "strong": tr("strong", "قوي")}[level]
+    return {"weak": tr("weak", "ضعيفة"), "medium": tr("medium", "متوسطة"), "strong": tr("strong", "قوية")}[level]
 
 
-# ---------------------------------------------------------------- direction (Arabic: from the right)
-def start() -> str:
-    """The side a row starts from: right in Arabic, left in English."""
-    return "right" if rtl() else "left"
-
-
-def end() -> str:
-    return "left" if rtl() else "right"
-
-
-def anchor() -> str:
-    return "e" if rtl() else "w"
-
-
-def justify() -> str:
-    return "right" if rtl() else "left"
+def mode_help(mode: str) -> str:
+    return {"learn": tr("The program gets to know the people in the photos and remembers them. "
+                        "No photo is copied.",
+                        "البرنامج بيتعرف على الناس اللي في الصور ويفتكرهم، من غير ما ينسخ أي صورة."),
+            "learn_sort": tr("Learns the people, then copies the photos into a folder for each person.",
+                             "بيتعرف على الناس، وبعدين بينسخ الصور في فولدر لكل شخص."),
+            "sort": tr("Only copies the photos into a folder for each person it already knows. "
+                       "The library does not change.",
+                       "بينسخ الصور بس في فولدر لكل شخص يعرفه. المكتبة مش بتتغير.")}[mode]
 
 
 # ---------------------------------------------------------------- helpers
-def _png(img: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", img)
-    return base64.b64encode(buf.tobytes()).decode()
-
-
-def photo_from_jpg(data: bytes | None, size: int) -> tk.PhotoImage:
-    img = decode_jpg(data) if data else None
-    if img is None:
-        img = np.full((size, size, 3), 70, np.uint8)
-    return tk.PhotoImage(data=_png(cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)))
-
-
-def photo_from_array(img: np.ndarray | None, size: int) -> tk.PhotoImage:
-    if img is None:
-        img = np.full((size, size, 3), 70, np.uint8)
-    return tk.PhotoImage(data=_png(cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)))
-
-
 def open_path(p: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(p)  # type: ignore[attr-defined]
@@ -143,359 +139,90 @@ def fmt_time(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def shorten_middle(text: str, font: tkfont.Font, width: int) -> str:
-    """Cut the middle of a long path so it fits: E:\\Photos\\…\\Library."""
-    if width <= 20 or font.measure(text) <= width:
-        return text
-    lo, hi = 1, len(text)
-    best = "…"
-    while lo <= hi:
-        keep = (lo + hi) // 2
-        cand = text[:keep // 2] + "…" + text[len(text) - (keep - keep // 2):]
-        if font.measure(cand) <= width:
-            best, lo = cand, keep + 1
-        else:
-            hi = keep - 1
-    return best
-
-
-# ---------------------------------------------------------------- building blocks
-class Flow(ttk.Frame):
-    """A row of widgets that wraps onto the next line when the window is too narrow, so nothing is hidden.
-
-    add(widget)            from the start side (right in Arabic)
-    add(widget, end=True)  grouped at the other side (in the order given, from the edge inwards)
-    """
-
-    def __init__(self, parent, padx: int = 3, pady: int = 3, **kw):
-        super().__init__(parent, width=10, height=10, **kw)
-        self.padx, self.pady = padx, pady
-        self.items: list[tuple[tk.Widget, bool]] = []
-        self._pending = False
-        self._width = 0
-        self.bind("<Configure>", self._on_configure)
-
-    def add(self, widget: tk.Widget, end: bool = False) -> tk.Widget:
-        self.items.append((widget, end))
-        widget.bind("<Configure>", lambda e: self.relayout(), add="+")
-        self.relayout()
-        return widget
-
-    def _on_configure(self, e) -> None:
-        if e.width != self._width:
-            self._width = e.width
-            self.relayout()
-
-    def relayout(self) -> None:
-        if not self._pending:
-            self._pending = True
-            self.after_idle(self._layout)
-
-    def _layout(self) -> None:
-        self._pending = False
-        if not self.winfo_exists():
-            return
-        width = self.winfo_width()
-        shown = [(w, e) for w, e in self.items if w.winfo_exists()]
-        if width <= 10:  # not on screen yet: one row is enough to say how tall it is
-            width = sum(w.winfo_reqwidth() + 2 * self.padx for w, _ in shown) or 10
-        rows: list[dict] = []
-
-        def new_row() -> dict:
-            rows.append({"start": [], "end": [], "used": 0})
-            return rows[-1]
-        row = new_row()
-        for w, at_end in shown:
-            if at_end:
-                continue
-            need = w.winfo_reqwidth() + 2 * self.padx
-            if row["start"] and row["used"] + need > width:
-                row = new_row()
-            row["start"].append(w)
-            row["used"] += need
-        for w, at_end in shown:
-            if not at_end:
-                continue
-            need = w.winfo_reqwidth() + 2 * self.padx
-            if (row["start"] or row["end"]) and row["used"] + need > width:
-                row = new_row()
-            row["end"].append(w)
-            row["used"] += need
-        y = self.pady
-        right_to_left = rtl()
-        for row in rows:
-            ws = row["start"] + row["end"]
-            if not ws:
-                continue
-            h = max(w.winfo_reqheight() for w in ws)
-            x = 0
-            for w in row["start"]:
-                ww = w.winfo_reqwidth()
-                left = width - x - self.padx - ww if right_to_left else x + self.padx
-                w.place(x=left, y=y + (h - w.winfo_reqheight()) // 2)
-                x += ww + 2 * self.padx
-            x = 0
-            for w in row["end"]:
-                ww = w.winfo_reqwidth()
-                left = x + self.padx if right_to_left else width - x - self.padx - ww
-                w.place(x=left, y=y + (h - w.winfo_reqheight()) // 2)
-                x += ww + 2 * self.padx
-            y += h + self.pady
-        if int(self.cget("height")) != y:
-            self.configure(height=y)
-
-
-class WrapLabel(ttk.Label):
-    """A label that breaks its text into lines to fit the width it is given, instead of cutting it."""
-
-    def __init__(self, parent, **kw):
-        kw.setdefault("justify", justify())
-        kw.setdefault("anchor", anchor())
-        super().__init__(parent, width=1, **kw)
-        self.bind("<Configure>", lambda e: self.configure(wraplength=max(40, e.width - 4)))
-
-
-class Tip:
-    """A small yellow note when the mouse rests on a widget (e.g. the full library path)."""
-
-    def __init__(self, widget: tk.Widget, text_fn):
-        self.widget, self.text_fn, self.win = widget, text_fn, None
-        widget.bind("<Enter>", self.show, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
-
-    def show(self, _=None) -> None:
-        text = self.text_fn()
-        if not text or self.win:
-            return
-        self.win = tk.Toplevel(self.widget)
-        self.win.wm_overrideredirect(True)
-        x, y = self.widget.winfo_rootx(), self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        self.win.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.win, text=text, background="#ffffe0", relief="solid", borderwidth=1, padx=6, pady=3,
-                 justify=justify(), wraplength=900).pack()
-
-    def hide(self, _=None) -> None:
-        if self.win:
-            self.win.destroy()
-            self.win = None
-
-
-def choose(parent: tk.Misc, title: str, message: str, options: list[str]) -> int | None:
-    """Ask a question with clear buttons (instead of Yes / No). Returns the button's index, None if closed."""
-    win = tk.Toplevel(parent)
-    win.title(title)
-    win.transient(parent.winfo_toplevel())
-    win.resizable(False, False)
-    body = ttk.Frame(win, padding=16)
-    body.pack(fill="both", expand=True)
-    ttk.Label(body, text=message, justify=justify(), wraplength=560).pack(anchor=anchor(), pady=(0, 12))
-    row = ttk.Frame(body)
-    row.pack(fill="x")
-    answer: list[int] = []
-
-    def pick(k: int) -> None:
-        answer.append(k)
-        win.destroy()
-    for k, text in enumerate(options):
-        ttk.Button(row, text=text, command=lambda k=k: pick(k)).pack(side=start(), padx=4)
-    win.bind("<Escape>", lambda e: win.destroy())
-    win.grab_set()
-    parent.wait_window(win)
-    return answer[0] if answer else None
-
-
 def ask_yes(parent: tk.Misc, title: str, message: str) -> bool:
     return messagebox.askyesno(title, message, parent=parent)
 
 
-def layout_problems(root: tk.Misc) -> list[str]:
-    """Widgets whose text does not fit, or that stick out of their window (used by the build test)."""
-    problems: list[str] = []
-    text_kinds = ("TButton", "TLabel", "TCheckbutton", "TRadiobutton", "Button", "Label", "Checkbutton",
-                  "Radiobutton")
-
-    def walk(w: tk.Misc, scrolled: bool = False) -> None:
-        if isinstance(w, tk.Toplevel) and w is not root:
-            return  # other windows are checked on their own
-        scrolled = scrolled or isinstance(w, tk.Canvas)  # scrolled content may be taller than the window
-        for c in w.winfo_children():
-            if not c.winfo_ismapped():
-                if c.winfo_manager() in ("pack", "grid", "place") and not isinstance(c, tk.Toplevel):
-                    try:  # laid out, but Tk had no room left to show it at all
-                        problems.append(f"hidden: {c.winfo_class()} {str(c.cget('text'))!r}")
-                    except tk.TclError:
-                        problems.append(f"hidden: {c.winfo_class()} {c}")
-                continue
-            name = c.winfo_class()
-            text = ""
-            try:
-                text = str(c.cget("text"))
-            except tk.TclError:
-                pass
-            if name in text_kinds and text and not isinstance(c, WrapLabel):
-                if c.winfo_width() + 1 < c.winfo_reqwidth() or c.winfo_height() + 1 < c.winfo_reqheight():
-                    problems.append(f"squeezed: {text!r} ({c.winfo_width()}x{c.winfo_height()} < "
-                                    f"{c.winfo_reqwidth()}x{c.winfo_reqheight()})")
-            if name in text_kinds and text:
-                top = c.winfo_toplevel()
-                x, y = c.winfo_rootx() - top.winfo_rootx(), c.winfo_rooty() - top.winfo_rooty()
-                if x < -1 or x + c.winfo_width() > top.winfo_width() + 1 or \
-                        (not scrolled and (y < -1 or y + c.winfo_height() > top.winfo_height() + 1)):
-                    problems.append(f"outside the window: {text!r} at {x},{y} {c.winfo_width()}x{c.winfo_height()}")
-                p = c.nametowidget(c.winfo_parent())
-                px, py = c.winfo_x(), c.winfo_y()
-                if px < -1 or py < -1 or px + c.winfo_width() > p.winfo_width() + 1 or \
-                        py + c.winfo_height() > p.winfo_height() + 1:
-                    problems.append(f"cut by its box: {text!r}")
-            walk(c, scrolled)
-    walk(root)
-    return problems
+def photo_thumb(path: Path, size: int) -> np.ndarray | None:
+    """A small picture of a photo file (for 'find'), read quickly."""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if path.suffix.lower() in HEIF_EXTS:
+        img, _ = read_heif(data.tobytes())
+    else:
+        flag = cv2.IMREAD_REDUCED_COLOR_4 if len(data) > 600_000 else cv2.IMREAD_COLOR
+        img = cv2.imdecode(data, flag)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    k = size / max(h, w)
+    return cv2.resize(img, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
 
 
-class Grid(ttk.Frame):
-    """A scrollable grid of small pictures with a state per picture and an optional keyboard cursor.
-
-    items: dicts with  key, jpg (bytes), on (True/False/None), dim (bool), caption (str)
-    headers: {index: text} -> a full-width title row before that item (e.g. years)
-    """
-
-    def __init__(self, parent, size: int = CELL, on_click=None, on_double=None):
-        super().__init__(parent)
-        self.size = size
-        self.on_click = on_click
-        self.on_double = on_double
-        self.canvas = tk.Canvas(self, highlightthickness=0, background="#1e1e1e")
-        sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side=end(), fill="y")
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda e: self.draw())
-        for ev, d in (("<MouseWheel>", None), ("<Button-4>", -1), ("<Button-5>", 1)):
-            self.canvas.bind(ev, lambda e, d=d: self.canvas.yview_scroll(d or (-1 if e.delta > 0 else 1), "units"))
-        self.items: list[dict] = []
-        self.headers: dict[int, str] = {}
-        self.cursor = -1
-        self.images: dict = {}
-        self._pos: list[tuple[int, int]] = []
-
-    def set_items(self, items: list[dict], headers: dict[int, str] | None = None, cursor: int = -1) -> None:
-        self.items, self.headers, self.cursor = items, headers or {}, cursor
-        for it in items:
-            if it["key"] not in self.images:
-                self.images[it["key"]] = photo_from_jpg(it.get("jpg"), self.size)
-        self.canvas.yview_moveto(0)
-        self.draw()
-
-    def draw(self) -> None:
-        c = self.canvas
-        c.delete("all")
-        width = max(1, c.winfo_width())
-        cell = self.size + 12
-        cols = max(1, (width - 6) // cell)
-        y = 0
-        col = 0
-        self._pos = []
-        for k, it in enumerate(self.items):
-            if k in self.headers:
-                if col:
-                    y += cell
-                    col = 0
-                c.create_text(width - 8 if rtl() else 8, y + 12, text=self.headers[k], anchor=anchor(), fill="#ddd",
-                              font=("TkDefaultFont", 11, "bold"))
-                y += 28
-            x = width - (col + 1) * cell + 6 if rtl() else col * cell + 6
-            self._pos.append((x, y))
-            on = it.get("on")
-            color = {True: "#3c3", False: "#c33", None: "#333"}[on]
-            if k == self.cursor:
-                c.create_rectangle(x - 5, y - 5, x + self.size + 5, y + self.size + 5, outline="#fd0", width=3)
-            rect = c.create_rectangle(x - 2, y - 2, x + self.size + 2, y + self.size + 2, outline=color, width=3)
-            im = c.create_image(x, y, image=self.images[it["key"]], anchor="nw")
-            tags = [rect, im]
-            if it.get("dim"):
-                tags.append(c.create_rectangle(x, y, x + self.size, y + self.size, fill="#000", stipple="gray50",
-                                               outline=""))
-            if on is False:
-                tags.append(c.create_text(x + self.size - 10, y + 10, text="✗", fill="#f55",
-                                          font=("TkDefaultFont", 14, "bold")))
-            if it.get("caption"):
-                tags.append(c.create_text(x + 3, y + self.size - 3, text=it["caption"], anchor="sw", fill="#ff0",
-                                          font=("TkDefaultFont", 8, "bold")))
-            for t in tags:
-                c.tag_bind(t, "<Button-1>", lambda e, k=k: self.on_click and self.on_click(k))
-                c.tag_bind(t, "<Double-Button-1>", lambda e, k=k: self.on_double and self.on_double(k))
-            col += 1
-            if col >= cols:
-                col = 0
-                y += cell
-        c.configure(scrollregion=(0, 0, width, y + cell + 10))
-
-    def show_cursor(self) -> None:
-        box = self.canvas.bbox("all")
-        if 0 <= self.cursor < len(self._pos) and box:
-            self.canvas.yview_moveto(max(0.0, (self._pos[self.cursor][1] - 40) / max(float(box[3]), 1.0)))
-
-    def columns(self) -> int:
-        return max(1, (max(1, self.canvas.winfo_width()) - 6) // (self.size + 12))
-
-
-def fit_window(win: tk.Toplevel | tk.Tk, width: int, height: int) -> None:
-    """Open a window at a size that fits the screen (small laptops, big zoom)."""
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    w, h = min(width, sw - 40), min(height, sh - 90)
-    win.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+def page_bg_window(win: tk.Toplevel) -> None:
+    win.configure(background=C["bg"])
 
 
 # ============================================================== review window
 class ReviewWindow(tk.Toplevel):
     def __init__(self, app: "App", review, mode: str, dest: str | None):
         super().__init__(app.root)
+        page_bg_window(self)
         self.app, self.review, self.mode, self.dest = app, review, mode, dest
         self.title(f"{tr('Review', 'المراجعة')}  —  {review.device}  ·  {review.folder}")
-        fit_window(self, 1200, 800)
+        fit_window(self, 1240, 820)
         self.transient(app.root)
         self.names = app.lib.names()
 
-        top = Flow(self, padx=6)
-        top.pack(fill="x", padx=10, pady=(8, 0))
+        head = ttk.Frame(self, style="Page.TFrame", padding=(16, 12, 16, 4))
+        head.pack(fill="x")
+        top = Flow(head, padx=4, style="Page.TFrame")
+        top.pack(fill="x")
         c = review.counts()
-        top.add(ttk.Label(top, font=app.f_bold, text=tr(
-            f"{len(review.photos)} photos · {len(review.faces)} faces", f"{len(review.photos)} صورة · {len(review.faces)} وش")
-            + f"   —   ❓ {c['maybe']}   ✅ {c['sure']}   👤 {c['seen_before']}   🆕 {c['new']}"))
-        WrapLabel(self, foreground="#666", text=tr(
-            "Keys: ←→↑↓ move · Space ✓/✗ · Del ✗ · Enter = OK, next · N = name · PgDn next",
-            "الكيبورد: الأسهم للتنقل · Space ✓/✗ · Del ✗ · Enter تمام واللي بعده · N الاسم · PgDn المجموعة اللي بعدها"
-        )).pack(fill="x", padx=12)
+        top.add(ttk.Label(top, text=tr("Review", "المراجعة"), style="PageTitle.TLabel"))
+        top.add(chip(top, tr(f"{len(review.photos)} photos", f"{len(review.photos)} صورة")))
+        top.add(chip(top, tr(f"{len(review.faces)} faces", f"{len(review.faces)} وش")))
+        for sec, color, soft in (("maybe", C["warn"], C["warn_soft"]), ("sure", C["ok"], C["ok_soft"]),
+                                 ("seen_before", C["muted"], ""), ("new", C["accent"], C["accent_soft"])):
+            top.add(chip(top, f"{section_label(sec)}  {c[sec]}", color, soft))
+        WrapLabel(head, style="PageSub.TLabel", text=tr(
+            "Click a face to accept ✓ or reject ✗ it.  Keys: arrows move · Space ✓/✗ · Del ✗ · "
+            "Enter = OK, next group · N = name · PgDn next group",
+            "دوس على أي وش عشان تقبله ✓ أو ترفضه ✗.  الكيبورد: الأسهم للتنقل · Space ✓/✗ · Del ✗ · "
+            "Enter تمام واللي بعدها · N الاسم · PgDn المجموعة اللي بعدها")).pack(fill="x", pady=(4, 0))
 
-        bottom = Flow(self, padx=4)
-        bottom.pack(side="bottom", fill="x", padx=10, pady=8)
+        bottom = Flow(self, padx=4, style="Page.TFrame")
+        bottom.pack(side="bottom", fill="x", padx=16, pady=10)
         where = f"  →  {Path(dest).name}" if dest else ""
-        bottom.add(ttk.Label(bottom, text=tr("Mode: ", "الوضع: ") + mode_label(mode) + where))
-        bottom.add(ttk.Button(bottom, text=tr("Save", "احفظ"), command=self.save), end=True)
+        bottom.add(ttk.Label(bottom, text=tr("Mode: ", "الوضع: ") + mode_label(mode) + where, style="PageSub.TLabel"))
+        bottom.add(ttk.Button(bottom, text=tr("✓ Save", "✓ احفظ"), style="Primary.TButton", command=self.save),
+                   end=True)
         bottom.add(ttk.Button(bottom, text=tr("Later", "بعدين"), command=self.destroy), end=True)
-        bottom.add(ttk.Button(bottom, text=tr("Discard session", "الغي الجلسة"), command=self.discard), end=True)
+        bottom.add(ttk.Button(bottom, text=tr("Discard session", "الغي الجلسة"), style="Danger.TButton",
+                              command=self.discard), end=True)
 
         body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10)
-        left = ttk.Frame(body)
-        right = ttk.Frame(body)
-        self.tree = ttk.Treeview(left, columns=("n",), selectmode="browse", show="tree headings")
-        self.tree.heading("#0", text=tr("Groups", "المجموعات"), anchor=anchor())
-        self.tree.heading("n", text=tr("Faces", "وشوش"))
-        self.tree.column("#0", width=270)
-        self.tree.column("n", width=max(60, app.f_bold.measure(tr("Faces", "وشوش")) + 18), anchor="center")
+        body.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+        left = Card(body, tr("Groups", "المجموعات"), padding=(10, 10))
+        right = Card(body, padding=(14, 12))
+        self.tree = ttk.Treeview(left.body, columns=("n",), selectmode="browse", show="tree")
+        self.tree.column("#0", width=250)
+        self.tree.column("n", width=max(60, Fonts.bold.measure("00/00") + 20), anchor="center")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_group())
         for pane, weight in ((right, 3), (left, 1)) if rtl() else ((left, 1), (right, 3)):
             body.add(pane, weight=weight)
 
-        self.head = WrapLabel(right, font=app.f_head)
+        r = right.body
+        self.head = WrapLabel(r, font=Fonts.head)
         self.head.pack(fill="x")
-        self.info = WrapLabel(right, foreground="#555")
-        self.info.pack(fill="x")
-        namebar = Flow(right, padx=3)
-        namebar.pack(fill="x", pady=4)
-        namebar.add(ttk.Label(namebar, text=tr("Name:", "الاسم:")))
+        self.info = WrapLabel(r, style="Muted.TLabel")
+        self.info.pack(fill="x", pady=(2, 6))
+        namebar = Flow(r, padx=3)
+        namebar.pack(fill="x", pady=2)
+        namebar.add(ttk.Label(namebar, text=tr("Name:", "الاسم:"), style="Bold.TLabel"))
         self.name_var = tk.StringVar()
         self.name_box = ttk.Combobox(namebar, textvariable=self.name_var, width=24, values=self.names,
                                      justify=justify())
@@ -503,14 +230,14 @@ class ReviewWindow(tk.Toplevel):
         self.name_box.bind("<<ComboboxSelected>>", lambda e: self.name_changed())
         self.name_box.bind("<KeyRelease>", lambda e: self.name_changed())
         self.name_box.bind("<Return>", lambda e: (self.name_changed(), self.focus_set(), "break")[-1])
-        self.cands = Flow(right, padx=2)
-        self.cands.pack(fill="x")
         self.isolate_btn = ttk.Button(namebar, text=tr("Isolate this person", "اعزل الشخص ده"), command=self.isolate)
         namebar.add(self.isolate_btn, end=True)
         namebar.add(ttk.Button(namebar, text=tr("All ✓", "الكل ✓"), command=lambda: self.set_all(True)), end=True)
         namebar.add(ttk.Button(namebar, text=tr("All ✗", "الكل ✗"), command=lambda: self.set_all(False)), end=True)
-        self.grid = Grid(right, on_click=self.click)
-        self.grid.pack(fill="both", expand=True)
+        self.cands = Flow(r, padx=2)
+        self.cands.pack(fill="x")
+        self.grid = Grid(r, on_click=self.click)
+        self.grid.pack(fill="both", expand=True, pady=(6, 0))
 
         self.group_items: dict[str, int] = {}
         self.fill_tree()
@@ -589,13 +316,12 @@ class ReviewWindow(tk.Toplevel):
         self.name_var.set(g.name)
         known = g.section in ("sure", "maybe") and g.person_id is not None
         self.isolate_btn.config(state="normal" if known else "disabled")
-        for w in self.cands.winfo_children():
-            w.destroy()
-        self.cands.items.clear()
+        self.cands.clear()
+        if g.candidates[:3]:
+            self.cands.add(ttk.Label(self.cands, text=tr("Maybe:", "يمكن:"), style="Muted.TLabel"))
         for cname, score in g.candidates[:3]:
             self.cands.add(ttk.Button(self.cands, text=f"{cname} ({score:.2f})",
                                       command=lambda n=cname: (self.name_var.set(n), self.name_changed())))
-        self.cands.relayout()
         self.draw_faces(cursor=0)
 
     def draw_faces(self, cursor: int | None = None) -> None:
@@ -705,7 +431,7 @@ class ReviewWindow(tk.Toplevel):
                 f"Take '{old}' out of the known people? Their faces go back to the unknown people, to be named again.",
                 f"تعزل '{old}'؟ وشوشه هترجع للمجهولين عشان تتسمّى تاني.")):
             return
-        self.app._append(self.app.lib.isolate([g.person_id]))
+        self.app.notify(self.app.lib.isolate([g.person_id]))
         for other in self.review.groups:  # every group of that person in this review
             if other.person_id == g.person_id and other.section in ("sure", "maybe"):
                 p = self.app.lib.person(g.person_id)
@@ -752,6 +478,7 @@ class App:
         scale = os.environ.get("FACE_SORTER_UI_SCALE")  # the build test tries 100%, 125% and 150%
         if scale:
             self.root.tk.call("tk", "scaling", float(scale) * 96 / 72)
+        self.zoom = float(self.root.tk.call("tk", "scaling")) / (96 / 72)
         self.root.report_callback_exception = self.on_error
         try:
             self.settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
@@ -759,10 +486,16 @@ class App:
             self.settings = {}
         st = self.settings
         set_language(os.environ.get("FACE_SORTER_LANGUAGE") or st.get("language", "ar"))
-        self.setup_style()
-        fit_window(self.root, 1280, 880)
+        theme(self.root)
+        self.root.configure(background=C["bg"])
+        try:
+            self.icon = app_icon(64)
+            self.root.iconphoto(True, self.icon)
+        except tk.TclError:
+            pass
+        fit_window(self.root, 1320, 880)
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        self.root.minsize(min(820, sw - 40), min(560, sh - 90))
+        self.root.minsize(min(860, sw - 40), min(560, sh - 90))
         if (sw < 1300 or sh < 800) and sys.platform.startswith("win"):
             self.root.state("zoomed")  # a small screen: use all of it
         self.lib = self.startup_library()
@@ -785,61 +518,212 @@ class App:
         self.f_stickers = tk.BooleanVar(value=st.get("skip_stickers", True))
         self.f_small = tk.BooleanVar(value=st.get("skip_small", True))
         self.f_exclude = tk.StringVar(value=st.get("exclude", ""))
+        self.settings_shown = bool(st.get("settings_shown", False))
         self.started = 0.0
         self.stage = (0, 0, 0)
         self.stage_start = (0, 0.0, 0)
         self.paused_at = 0.0
-        self.ui: ttk.Frame | None = None
+        self.ui: tk.Frame | None = None
+        self.page = "scan"
+        self.who_paths: list[Path] = []
+        self.find_results: list = []
+        self.find_job = 0
         self.build_ui()
+        self.root.bind("<Configure>", lambda e: e.widget is self.root and (self.fit_sidebar(), self.fit_height()),
+                       add="+")
+        for k, key in enumerate(PAGES, 1):  # Ctrl+1 … Ctrl+5: the pages of the side menu
+            self.root.bind(f"<Control-Key-{k}>", lambda e, key=key: self.show_page(key))
         self.root.after(100, self.pump)
 
-    def setup_style(self) -> None:
-        """Slightly bigger text, clear tabs, and fonts for titles."""
-        base = tkfont.nametofont("TkDefaultFont")
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-            try:
-                tkfont.nametofont(name).configure(size=10)
-            except tk.TclError:
-                pass
-        family = base.actual("family")
-        self.f_title = tkfont.Font(self.root, family=family, size=14, weight="bold")
-        self.f_head = tkfont.Font(self.root, family=family, size=12, weight="bold")
-        self.f_bold = tkfont.Font(self.root, family=family, size=10, weight="bold")
-        self.f_tab = tkfont.Font(self.root, family=family, size=11, weight="bold")
-        style = ttk.Style(self.root)
-        style.configure("TNotebook", tabposition="ne" if rtl() else "nw")
-        style.configure("TNotebook.Tab", padding=(16, 6), font=self.f_tab)
-        style.configure("Card.TFrame", relief="groove", borderwidth=2)
-        style.configure("People.Treeview", rowheight=44)
-        style.configure("Treeview.Heading", font=self.f_bold)
-
+    # ================================================================ frame of the window
     def build_ui(self) -> None:
         """Make (or remake, after changing the language) everything inside the window."""
-        self.root.title(f"Face Sorter v{__version__} - " + tr("Face library", "مكتبة الوشوش"))
-        self.ui = ttk.Frame(self.root)
+        self.root.title(f"Face Sorter v{__version__} — " + tr("face library", "مكتبة الوشوش"))
+        self.ui = tk.Frame(self.root, background=C["bg"])
         self.ui.pack(fill="both", expand=True)
-        self._build_card()
-        nb = ttk.Notebook(self.ui)
-        nb.pack(fill="both", expand=True, padx=6, pady=(6, 6))
-        self.nb = nb
-        self.tab_pc = ttk.Frame(nb, padding=10)
-        self.tab_who = ttk.Frame(nb, padding=10)
-        self.tab_lib = ttk.Frame(nb, padding=10)
-        tabs = [(self.tab_pc, tr("🖥  This computer", "🖥  الجهاز ده")),
-                (self.tab_who, tr("🔍  Who is this?", "🔍  مين ده؟")),
-                (self.tab_lib, tr("📚  Library", "📚  المكتبة"))]
-        for frame, text in (reversed(tabs) if rtl() else tabs):  # Arabic: the first tab is on the right
-            nb.add(frame, text=f" {text} ")
-        nb.select(self.tab_pc)
-        nb.bind("<<NotebookTabChanged>>", lambda e: self.on_tab())
-        self._build_pc()
-        self._build_who()
-        self._build_library()
+        self._build_sidebar()
+        main = ttk.Frame(self.ui, style="Page.TFrame")
+        main.pack(side=start(), fill="both", expand=True)
+        self._build_header(main)
+        self._build_status(main)
+        self.content = ttk.Frame(main, style="Page.TFrame")
+        self.content.pack(fill="both", expand=True, padx=18, pady=(14, 10))
+        self.pages: dict[str, ttk.Frame] = {}
+        self.subtitles: list[WrapLabel] = []
+        self.short = False
+        for key in PAGES:
+            self.pages[key] = ttk.Frame(self.content, style="Page.TFrame")
+        self._build_scan(self.pages["scan"])
+        self._build_who(self.pages["who"])
+        self._build_find(self.pages["find"])
+        self._build_people(self.pages["people"])
+        self._build_library_page(self.pages["library"])
+        self.show_page(self.page if self.page in PAGES else "scan")
         self.refresh_all()
+        self.fit_sidebar()
+        self.fit_height()
 
-    def on_tab(self) -> None:
-        if self.nb.select() == str(self.tab_lib):
-            self.refresh_library()
+    def _build_sidebar(self) -> None:
+        sb = tk.Frame(self.ui, background=C["nav"])
+        sb.pack(side=start(), fill="y")
+        self.sidebar = sb
+        brand = tk.Frame(sb, background=C["nav"])
+        brand.pack(fill="x", padx=14, pady=(18, 22))
+        self.brand_icon = tk.Label(brand, text="◉", background=C["nav"], foreground="#60A5FA", font=Fonts.big)
+        self.brand_icon.pack(side=start())
+        self.brand_text = tk.Frame(brand, background=C["nav"])
+        self.brand_text.pack(side=start(), padx=8)
+        tk.Label(self.brand_text, text="Face Sorter", background=C["nav"], foreground="#FFFFFF",
+                 font=Fonts.head).pack(anchor=anchor())
+        tk.Label(self.brand_text, text=tr("face library", "مكتبة الوشوش"), background=C["nav"],
+                 foreground=C["nav_text"], font=Fonts.small).pack(anchor=anchor())
+        self.nav: dict[str, tuple] = {}
+        for key, (icon, text) in page_names().items():
+            item = tk.Frame(sb, background=C["nav"], cursor="hand2")
+            item.pack(fill="x", pady=1)
+            bar = tk.Frame(item, background=C["nav"], width=4)
+            bar.pack(side=start(), fill="y")
+            ic = tk.Label(item, text=icon, background=C["nav"], foreground="#FFFFFF", font=Fonts.icon, width=2)
+            ic.pack(side=start(), padx=(12, 6) if not rtl() else (6, 12), pady=9)
+            tx = tk.Label(item, text=text, background=C["nav"], foreground=C["nav_text"], font=Fonts.nav,
+                          anchor=anchor())
+            tx.pack(side=start(), fill="x", expand=True, padx=(0, 18) if not rtl() else (18, 0))
+            for w in (item, ic, tx):
+                w.bind("<Button-1>", lambda e, k=key: self.show_page(k))
+                w.bind("<Enter>", lambda e, k=key: self.nav_paint(k, hover=True))
+                w.bind("<Leave>", lambda e, k=key: self.nav_paint(k))
+            n = list(page_names()).index(key) + 1
+            Tip(item, lambda t=text, n=n: f"{t}   (Ctrl+{n})" if self.compact else f"Ctrl+{n}")
+            self.nav[key] = (item, bar, ic, tx)
+        self.version_label = tk.Label(sb, text=f"v{__version__}", background=C["nav"], foreground="#64748B",
+                                      font=Fonts.small)
+        self.version_label.pack(side="bottom", pady=10)
+        self.compact = False
+
+    def nav_paint(self, key: str, hover: bool = False) -> None:
+        item, bar, ic, tx = self.nav[key]
+        active = key == self.page
+        bg = C["nav_active"] if active else (C["nav_hover"] if hover else C["nav"])
+        for w in (item, ic, tx):
+            w.configure(background=bg)
+        bar.configure(background="#60A5FA" if active else bg)
+        tx.configure(foreground="#FFFFFF" if active else C["nav_text"],
+                     font=Fonts.bold if active else Fonts.nav)
+
+    def fit_sidebar(self) -> None:
+        """Narrow window: the side menu shows icons only."""
+        if not self.ui or not self.ui.winfo_exists():
+            return
+        compact = self.root.winfo_width() < int(1180 * self.zoom)
+        if compact == self.compact:
+            return
+        self.compact = compact
+        for item, bar, ic, tx in self.nav.values():
+            if compact:
+                tx.pack_forget()
+            else:
+                tx.pack(side=start(), fill="x", expand=True, padx=(0, 18) if not rtl() else (18, 0))
+        if compact:
+            self.brand_text.pack_forget()
+        else:
+            self.brand_text.pack(side=start(), padx=8)
+
+    def show_page(self, key: str) -> None:
+        if key not in self.pages:
+            return
+        for k, f in self.pages.items():
+            if k != key:
+                f.pack_forget()
+        self.pages[key].pack(fill="both", expand=True)
+        self.page = key
+        for k in self.nav:
+            self.nav_paint(k)
+        if key == "people":
+            self.refresh_people()
+        elif key == "find":
+            self.refresh_find_people()
+        elif key == "library":
+            self.refresh_library_page()
+
+    def page_head(self, parent, title: str, subtitle: str) -> ttk.Frame:
+        f = ttk.Frame(parent, style="Page.TFrame")
+        f.pack(fill="x", pady=(0, 10))
+        ttk.Label(f, text=title, style="PageTitle.TLabel").pack(anchor=anchor())
+        sub = WrapLabel(f, text=subtitle, style="PageSub.TLabel")
+        sub.pack(fill="x", pady=(2, 0))
+        self.subtitles.append(sub)
+        return f
+
+    def fit_height(self) -> None:
+        """A short window (small screen, big zoom): the pages drop their one-line explanations."""
+        short = self.root.winfo_height() < int(740 * self.zoom)
+        if short == self.short:
+            return
+        self.short = short
+        for sub in self.subtitles:
+            if sub.winfo_exists():
+                if short:
+                    sub.pack_forget()
+                else:
+                    sub.pack(fill="x", pady=(2, 0))
+
+    def _build_header(self, main) -> None:
+        hdr = tk.Frame(main, background=C["card"])
+        hdr.pack(fill="x")
+        tk.Frame(main, background=C["border"], height=1).pack(fill="x")
+        inner = ttk.Frame(hdr, padding=(18, 12, 18, 10))
+        inner.pack(fill="x")
+        btns = ttk.Frame(inner)
+        btns.pack(side=end(), anchor="n")
+        other = "en" if language() == "ar" else "ar"
+        self.lang_btn = ttk.Button(btns, text="🌐 " + LANGUAGES[other], command=self.change_language)
+        self.lang_btn.pack(side=start(), padx=3)
+        self.manage_btn = ttk.Button(btns, text=tr("⚙ Manage", "⚙ إدارة المكتبة"),
+                                     command=lambda: self.show_page("library"))
+        self.manage_btn.pack(side=start(), padx=3)
+        text = ttk.Frame(inner)
+        text.pack(side=start(), fill="x", expand=True)
+        row = ttk.Frame(text)
+        row.pack(fill="x")
+        ttk.Label(row, text="📚", font=Fonts.title).pack(side=start(), anchor="n")
+        self.card_name = WrapLabel(row, font=Fonts.head)
+        self.card_name.pack(side=start(), fill="x", expand=True, padx=8, pady=(4, 0))
+        self.card_path = ttk.Label(text, style="Muted.TLabel", anchor=anchor())
+        self.card_path.pack(fill="x", pady=(2, 4))
+        self.card_path.bind("<Configure>", lambda e: self.show_card_path())
+        Tip(self.card_path, lambda: str(self.lib.path) if self.lib else "")
+        self.chips = Flow(text, padx=3, pady=1)
+        self.chips.pack(fill="x")
+        if TkinterDnD:  # drop a library file on the top bar to open or merge it
+            for w in (hdr, inner, self.card_name, self.card_path):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", lambda e: self.drop_library(e.data))
+
+    def _build_status(self, main) -> None:
+        bar = tk.Frame(main, background=C["card"])
+        bar.pack(side="bottom", fill="x")
+        tk.Frame(main, background=C["border"], height=1).pack(side="bottom", fill="x")
+        self.status_icon = tk.Label(bar, text="●", background=C["card"], foreground=C["ok"], font=Fonts.small)
+        self.status_icon.pack(side=start(), padx=(14, 4) if not rtl() else (4, 14), pady=5)
+        self.status = tk.Label(bar, text=tr("Ready.", "جاهز."), background=C["card"], foreground=C["muted"],
+                               font=Fonts.small, anchor=anchor(), justify=justify())
+        self.status.pack(side=start(), fill="x", expand=True)
+        self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=max(100, e.width - 10)))
+        self.status_job = None
+
+    def notify(self, text: str, kind: str = "ok") -> None:
+        """Show the result of an action at the bottom of the window (and in the scan log)."""
+        if not text:
+            return
+        if hasattr(self, "logbox") and self.logbox.winfo_exists():
+            self._append(text)
+        color = {"ok": C["ok"], "warn": C["warn"], "error": C["danger"], "info": C["accent"]}.get(kind, C["ok"])
+        self.status_icon.configure(foreground=color)
+        self.status.configure(text=text.replace("\n", "  ·  "), foreground=C["text"])
+        if self.status_job:
+            self.root.after_cancel(self.status_job)
+        self.status_job = self.root.after(8000, lambda: self.status.winfo_exists() and
+                                          self.status.configure(foreground=C["muted"]))
 
     def change_language(self) -> None:
         if self.busy:
@@ -855,48 +739,88 @@ class App:
                 w.destroy()
         if self.ui is not None:
             self.ui.destroy()
-        self.setup_style()
+        self.compact = False
         self.build_ui()
 
-    # ============================================================ this computer
-    def _build_pc(self) -> None:
-        f = self.tab_pc
-        pad = {"padx": 6, "pady": 3}
-        src = ttk.Frame(f)
-        src.pack(fill="x", **pad)
-        self.lib_label = ttk.Label(src, font=self.f_bold)
-        self.lib_label.pack(side=start())
-        ttk.Button(src, text="...", width=4, command=lambda: self.pick(self.src_var)).pack(side=end(), padx=(4, 0))
-        src_entry = ttk.Entry(src, textvariable=self.src_var)
-        src_entry.pack(side=start(), fill="x", expand=True, padx=6)
+    # ============================================================ page: this computer
+    def _build_scan(self, page) -> None:
+        actions = Flow(page, padx=4, style="Page.TFrame")
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        self.who_btn = ttk.Button(actions, text=tr("🔍 Who is this?", "🔍 مين ده؟"),
+                                  command=lambda: self.show_page("who"))
+        self.resume_btn = ttk.Button(actions, text=tr("Continue review", "كمّل المراجعة"), command=self.resume_review)
+        self.start_btn = ttk.Button(actions, text=tr("▶  Start", "▶  ابدأ"), style="Primary.TButton",
+                                    command=self.start)
+        self.pause_btn = ttk.Button(actions, text=tr("⏸ Pause", "⏸ إيقاف مؤقت"), state="disabled",
+                                    command=self.toggle_pause)
+        self.stop_btn = ttk.Button(actions, text=tr("■ Stop", "■ وقّف"), state="disabled",
+                                   command=self.throttle.stop.set)
+        actions.add(self.who_btn)
+        actions.add(self.resume_btn)
+        for b in (self.start_btn, self.stop_btn, self.pause_btn):
+            actions.add(b, end=True)
+        self.actions = actions
+
+        sf = ScrollFrame(page)
+        sf.pack(fill="both", expand=True)
+        self.scan_scroll = sf
+        f = sf.inner
+        self.page_head(f, tr("Sort the photos on this computer", "رتّب صور الجهاز ده"), tr(
+            "Choose the photos folder: the program finds the faces, recognises the people it knows, and groups "
+            "the new ones so you can name them.",
+            "اختار فولدر الصور: البرنامج هيلاقي الوشوش، ويعرّفك على الناس اللي يعرفهم، ويجمّع الجداد عشان تسمّيهم."))
+
+        src = Card(f, tr("1   The photos", "1   الصور"))
+        src.pack(fill="x", pady=(0, 10))
+        self.device_chip = chip(src.head, "")
+        src.head_add(self.device_chip)
+        row = ttk.Frame(src.body)
+        row.pack(fill="x")
+        ttk.Button(row, text=tr("Choose folder…", "اختار فولدر…"),
+                   command=lambda: self.pick(self.src_var)).pack(side=end(), padx=(8, 0) if not rtl() else (0, 8))
+        src_entry = ttk.Entry(row, textvariable=self.src_var)
+        src_entry.pack(side=start(), fill="x", expand=True)
+        ttk.Label(src.body, style="Muted.TLabel", text=tr(
+            "Tip: you can also drag a folder from Windows and drop it here.",
+            "ممكن كمان تسحب فولدر من الويندوز وتفلته هنا.")).pack(anchor=anchor(), pady=(6, 0))
         if TkinterDnD:  # drop a folder of photos here
-            src_entry.drop_target_register(DND_FILES)
-            src_entry.dnd_bind("<<Drop>>", lambda e: self.drop_folder(e.data))
+            for w in (src, src.body, src_entry):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", lambda e: self.drop_folder(e.data))
 
-        head = ttk.Frame(f)
-        head.pack(fill="x", **pad)
-        self.settings_btn = ttk.Button(head, command=lambda: self.show_settings(not self.settings_shown, True))
-        self.settings_btn.pack(side=start())
-        self.settings_summary = WrapLabel(head, foreground="#555")
-        self.settings_summary.pack(side=start(), fill="x", expand=True, padx=8)
-        box = ttk.Frame(f, style="Card.TFrame", padding=(8, 2, 8, 4))
-        self.settings_head, self.settings_box = head, box
-
-        def row(title: str) -> Flow:
-            r = Flow(box, padx=5, pady=2)
-            r.pack(fill="x")
-            r.add(ttk.Label(r, text=title, font=self.f_bold, foreground="#345"))
-            return r
-        modes = row(tr("Mode:", "الوضع:"))
+        mode = Card(f, tr("2   What to do", "2   هتعمل إيه؟"))
+        mode.pack(fill="x", pady=(0, 10))
+        modes = Flow(mode.body, padx=8)
+        modes.pack(fill="x")
         for m in MODES:
             modes.add(ttk.Radiobutton(modes, text=mode_label(m), value=m, variable=self.mode_var,
                                       command=self.mode_changed))
-        modes.add(ttk.Label(modes, text=tr("Sorted photos to:", "الصور المرتبة في:")))
-        self.dest_entry = ttk.Entry(modes, textvariable=self.dest_var, width=30)
-        modes.add(self.dest_entry)
-        self.dest_btn = ttk.Button(modes, text="...", width=4, command=lambda: self.pick(self.dest_var))
-        modes.add(self.dest_btn)
+        self.mode_help = WrapLabel(mode.body, style="Muted.TLabel")
+        self.mode_help.pack(fill="x", pady=(4, 0))
+        self.dest_row = ttk.Frame(mode.body)
+        ttk.Label(self.dest_row, text=tr("Put the sorted photos in:", "حط الصور المرتبة في:"),
+                  style="Bold.TLabel").pack(side=start())
+        self.dest_btn = ttk.Button(self.dest_row, text=tr("Choose…", "اختار…"), command=lambda: self.pick(self.dest_var))
+        self.dest_btn.pack(side=end(), padx=(8, 0) if not rtl() else (0, 8))
+        self.dest_entry = ttk.Entry(self.dest_row, textvariable=self.dest_var)
+        self.dest_entry.pack(side=start(), fill="x", expand=True, padx=8)
 
+        fold = ttk.Frame(f, style="Page.TFrame")
+        fold.pack(fill="x", pady=(0, 6))
+        self.settings_btn = ttk.Button(fold, style="PageLink.TButton",
+                                       command=lambda: self.show_settings(not self.settings_shown, True))
+        self.settings_btn.pack(side=start())
+        self.settings_summary = WrapLabel(fold, style="PageSub.TLabel")
+        self.settings_summary.pack(side=start(), fill="x", expand=True, padx=8)
+        self.settings_head = fold
+        adv = Card(f)
+        self.settings_box = adv
+
+        def row(title: str) -> Flow:
+            r = Flow(adv.body, padx=5, pady=3)
+            r.pack(fill="x")
+            r.add(ttk.Label(r, text=title, style="Bold.TLabel"))
+            return r
         filt = row(tr("Skip:", "تجاهل:"))
         filt.add(ttk.Checkbutton(filt, text=tr("Screenshots", "سكرين شوت"), variable=self.f_shots))
         filt.add(ttk.Checkbutton(filt, text=tr("Stickers", "ستيكرات"), variable=self.f_stickers))
@@ -904,10 +828,9 @@ class App:
                                  variable=self.f_small))
         filt.add(ttk.Label(filt, text=tr("Folders (comma-separated):", "فولدرات (بينهم فاصلة):")))
         filt.add(ttk.Entry(filt, textvariable=self.f_exclude, width=24))
-
-        opts = row(tr("Options:", "اختيارات:"))
+        opts = row(tr("Recognition:", "التعرف:"))
         opts.add(ttk.Label(opts, text=tr("Strictness", "الدقة")))
-        s_label = ttk.Label(opts, width=3)
+        s_label = ttk.Label(opts, width=3, style="Bold.TLabel")
 
         def on_strict(_=None):
             self.strict_var.set(round(float(self.strict_var.get())))
@@ -919,7 +842,6 @@ class App:
         opts.add(ttk.Spinbox(opts, from_=1, to=20, textvariable=self.minp_var, width=4))
         opts.add(ttk.Checkbutton(opts, text=tr("Copy Others / No_faces too", "انسخ Others و No_faces كمان"),
                                  variable=self.others_var))
-
         speed = row(tr("Speed:", "السرعة:"))
         for lvl in LEVELS:
             speed.add(ttk.Radiobutton(speed, text=speed_label(lvl), value=lvl, variable=self.speed_var,
@@ -929,78 +851,64 @@ class App:
         speed.add(cb)
         if psutil is None:
             cb.config(state="disabled")
-        self.battery_label = ttk.Label(speed, foreground="#c60")
+        self.battery_label = ttk.Label(speed, style="Warn.TLabel")
         speed.add(self.battery_label)
+
+        prog = Card(f, tr("Progress", "التقدم"))
+        prog.pack(fill="x", pady=(4, 0))
+        self.progress_card = prog
+        line = ttk.Frame(prog.body)
+        line.pack(fill="x")
+        self.progress_label = ttk.Label(line, style="Bold.TLabel", text=tr("Not started yet.", "لسه مبدأش."))
+        self.progress_label.pack(side=start())
+        self.time_label = ttk.Label(line, style="Muted.TLabel")
+        self.time_label.pack(side=end())
+        self.bar = ttk.Progressbar(prog.body, maximum=100)
+        self.bar.pack(fill="x", pady=(8, 8))
+        self.logbox = style_tk(tk.Text(prog.body, height=7, state="disabled", wrap="word", font=Fonts.small,
+                                       padx=8, pady=6))
+        self.logbox.tag_configure("line", justify=justify())
+        self.logbox.tag_configure("hint", justify=justify(), foreground=C["faint"])
+        self.logbox.pack(fill="x")
+        self.logbox.config(state="normal")
+        self.logbox.insert("end", tr("The steps of the work appear here: how many photos, how many faces, "
+                                     "and what was saved.",
+                                     "هنا هتظهر خطوات الشغل: كام صورة، وكام وش، واللي اتحفظ."), "hint")
+        self.logbox.config(state="disabled")
         for var in (self.mode_var, self.speed_var, self.strict_var):
             var.trace_add("write", lambda *_: self.update_settings_summary())
-        self.settings_shown = False
-        self.show_settings(self.settings.get("settings_shown", True), False)
-        self.tab_pc.bind("<Configure>", lambda e: self.root.after(300, self.fold_if_short), add="+")
-
-        btns = Flow(f, padx=3)
-        btns.pack(side="bottom", fill="x", **pad)
-        self.who_btn = ttk.Button(btns, text=tr("🔍 Who is this?", "🔍 مين ده؟"),
-                                  command=lambda: self.nb.select(self.tab_who))
-        self.resume_btn = ttk.Button(btns, text=tr("Continue review", "كمّل المراجعة"), command=self.resume_review)
-        self.start_btn = ttk.Button(btns, text=tr("▶ Start", "▶ ابدأ"), command=self.start)
-        self.pause_btn = ttk.Button(btns, text=tr("⏸ Pause", "⏸ إيقاف مؤقت"), state="disabled",
-                                    command=self.toggle_pause)
-        self.stop_btn = ttk.Button(btns, text=tr("■ Stop", "■ وقّف"), state="disabled", command=self.throttle.stop.set)
-        self.btns = btns
-        btns.add(self.who_btn)
-        btns.add(self.resume_btn)
-        for b in (self.start_btn, self.stop_btn, self.pause_btn):
-            btns.add(b, end=True)
-
-        self.bar = ttk.Progressbar(f, maximum=100)
-        self.bar.pack(fill="x", padx=6, pady=(10, 2))
-        info = ttk.Frame(f)
-        info.pack(fill="x", padx=6)
-        self.progress_label = ttk.Label(info, font=self.f_bold)
-        self.progress_label.pack(side=start())
-        self.time_label = ttk.Label(info)
-        self.time_label.pack(side=end())
-        self.logbox = tk.Text(f, height=5, state="disabled", wrap="word")
-        self.logbox.tag_configure("line", justify=justify())
-        self.logbox.pack(fill="both", expand=True, **pad)
+        self.show_settings(self.settings_shown, False)
         self.mode_changed()
 
     def show_settings(self, shown: bool, by_user: bool) -> None:
-        """The settings can be folded away, so the messages keep their room on small screens."""
+        """The advanced settings can be folded away."""
         self.settings_shown = shown
         if by_user:
             self.settings["settings_shown"] = shown
-            self.settings_touched = True
             self.remember()
         if shown:
-            self.settings_box.pack(fill="x", padx=6, pady=3, after=self.settings_head)
+            self.settings_box.pack(fill="x", pady=(0, 10), after=self.settings_head)
         else:
             self.settings_box.pack_forget()
-        self.settings_btn.config(text=("▾ " if shown else "▸ ") + tr("⚙ Settings", "⚙ الإعدادات"))
+        self.settings_btn.config(text=("▾ " if shown else ("◂ " if rtl() else "▸ ")) +
+                                 tr("⚙ Advanced settings", "⚙ إعدادات متقدمة"))
         self.update_settings_summary()
 
     def update_settings_summary(self) -> None:
         if not hasattr(self, "settings_summary") or not self.settings_summary.winfo_exists():
             return
         text = "" if self.settings_shown else (
-            mode_label(self.mode_var.get()) + "  ·  " + speed_label(self.speed_var.get()) + "  ·  "
-            + tr("strictness ", "الدقة ") + str(self.strict_var.get()))
+            speed_label(self.speed_var.get()) + "  ·  " + tr("strictness ", "الدقة ") + str(self.strict_var.get()))
         self.settings_summary.config(text=text)
 
-    def fold_if_short(self) -> None:
-        """A short window (small screen, big zoom): fold the settings once, unless the user chose."""
-        if getattr(self, "settings_touched", False) or not self.settings_shown:
-            return
-        if not self.root.winfo_ismapped() or self.root.winfo_height() < 300 or not self.logbox.winfo_exists():
-            return
-        if self.nb.select() == str(self.tab_pc) and (not self.logbox.winfo_ismapped()
-                                                      or self.logbox.winfo_height() < 50):
-            self.show_settings(False, False)
-
     def mode_changed(self) -> None:
-        state = "disabled" if self.mode_var.get() == "learn" else "normal"
-        self.dest_entry.config(state=state)
-        self.dest_btn.config(state=state)
+        m = self.mode_var.get()
+        self.mode_help.config(text=mode_help(m))
+        if m == "learn":
+            self.dest_row.pack_forget()
+        else:
+            self.dest_row.pack(fill="x", pady=(8, 0))
+        self.update_settings_summary()
 
     def pick(self, var: tk.StringVar) -> None:
         d = filedialog.askdirectory()
@@ -1044,6 +952,7 @@ class App:
         self.logbox.config(state="normal")
         self.logbox.delete("1.0", "end")
         self.logbox.config(state="disabled")
+        self.root.after(50, lambda: self.scan_scroll.canvas.yview_moveto(1.0))  # show the progress
         lib, flt, strict, minp = self.lib, self.filters(), self.strict_var.get(), max(1, int(self.minp_var.get()))
         self.on_speed()
 
@@ -1068,107 +977,485 @@ class App:
     def finish_save(self, report: str) -> None:
         self.msgs.put(("report", report))
 
-    # ================================================================ library tab
-    def _build_library(self) -> None:
-        f = self.tab_lib
-        self.lib_stats = WrapLabel(f, font=self.f_bold)
-        self.lib_stats.pack(fill="x")
-        bar = Flow(f, padx=3)
-        bar.pack(fill="x", pady=(6, 0))
-        self.lib_buttons = []
-        for text, cmd in ((tr("🔍 Who is this?", "🔍 مين ده؟"), lambda: self.nb.select(self.tab_who)),
-                          (tr("Possible duplicates", "يمكن متكررين"), self.open_duplicates),
-                          (tr("Sessions & undo", "الجلسات والتراجع"), self.open_sessions),
-                          (tr("Log", "السجل"), self.open_log),
-                          (tr("Backups", "النسخ الاحتياطية"), self.open_backups),
-                          (tr("Reset learning", "امسح التعلم التلقائي"), self.reset_learning),
-                          (tr("About", "عن البرنامج"), self.show_about),
-                          (tr("↻ Refresh", "↻ حدّث"), self.refresh_library)):
-            b = ttk.Button(bar, text=text, command=cmd)
-            bar.add(b)
-            self.lib_buttons.append(b)
+    # ============================================================ page: who is this?
+    def _build_who(self, page) -> None:
+        self.page_head(page, tr("Who is this?", "مين ده؟"), tr(
+            "Drop one or more photos to see who is in them. Nothing changes in the library unless you press Save.",
+            "اسحب صورة أو أكتر وافلتها، وهتعرف مين فيها. المكتبة مش بتتغير غير لما تدوس احفظ."))
+        drop = tk.Canvas(page, height=84, background=C["drop"], highlightthickness=0, cursor="hand2")
+        drop.pack(fill="x")
+        hint = tr("🖼   Drop photos here, or click to choose", "🖼   اسحب الصور وافلتها هنا، أو دوس عشان تختار") \
+            if TkinterDnD else tr("🖼   Click to choose photos", "🖼   دوس عشان تختار الصور")
 
-        body = ttk.PanedWindow(f, orient="horizontal")
-        body.pack(fill="both", expand=True, pady=8)
-        left = ttk.Frame(body)
-        right = ttk.Frame(body)
+        def paint(e=None):
+            drop.delete("all")
+            w, h = drop.winfo_width(), drop.winfo_height()
+            drop.create_rectangle(3, 3, w - 3, h - 3, outline="#93B4F0", width=2, dash=(6, 4))
+            drop.create_text(w // 2, h // 2, text=hint, font=Fonts.head, fill=C["accent"])
+        drop.bind("<Configure>", paint)
+        drop.bind("<Button-1>", lambda e: self.who_choose())
+        if TkinterDnD:
+            drop.drop_target_register(DND_FILES)
+            drop.dnd_bind("<<Drop>>", lambda e: self.who_add(dropped_paths(self.root, e.data)))
+        bar = Flow(page, padx=3, style="Page.TFrame")
+        bar.pack(fill="x", pady=8)
+        bar.add(ttk.Button(bar, text=tr("Choose photos…", "اختار صور…"), command=self.who_choose))
+        bar.add(ttk.Button(bar, text=tr("Clear the list", "امسح القائمة"), command=self.who_clear))
+        body = ttk.PanedWindow(page, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        lst = Card(body, tr("Photos", "الصور"), padding=(10, 10))
+        self.who_list = style_tk(tk.Listbox(lst.body, width=16, justify=justify(), activestyle="none"))
+        self.who_list.pack(fill="both", expand=True)
+        self.who_list.bind("<<ListboxSelect>>", lambda e: self.who_show())
+        pic = Card(body, padding=(8, 8))
+        self.who_canvas = tk.Canvas(pic.body, background=C["grid"], highlightthickness=0, width=240)
+        self.who_canvas.pack(fill="both", expand=True)
+        self.who_canvas.bind("<Configure>", lambda e: self.who_draw())
+        faces = Card(body, tr("Faces", "الوشوش"), padding=(10, 10))
+        panes = [(lst, 1), (pic, 3), (faces, 2)]
+        for pane, weight in (reversed(panes) if rtl() else panes):
+            body.add(pane, weight=weight)
+        holder = tk.Canvas(faces.body, highlightthickness=0, width=280, background=C["card"])
+        sb = ttk.Scrollbar(faces.body, orient="vertical", command=holder.yview)
+        self.who_faces = ttk.Frame(holder)
+        self.who_faces.bind("<Configure>", lambda e: holder.configure(scrollregion=holder.bbox("all")))
+        win_id = holder.create_window((0, 0), window=self.who_faces, anchor="nw")
+        holder.bind("<Configure>", lambda e: holder.itemconfigure(win_id, width=e.width))
+        holder.configure(yscrollcommand=sb.set)
+        sb.pack(side=end(), fill="y")
+        holder.pack(fill="both", expand=True)
+        self.who_result = None   # (path, img, results)
+        self.who_images: list = []
+        for p in self.who_paths:
+            self.who_list.insert("end", p.name)
+        self.who_empty()
+
+    def who_empty(self) -> None:
+        for w in self.who_faces.winfo_children():
+            w.destroy()
+        WrapLabel(self.who_faces, style="Muted.TLabel", text=tr(
+            "Choose a photo: every face in it appears here with its name, and you can save a face for a name.",
+            "اختار صورة: كل وش فيها هيظهر هنا باسمه، وتقدر تحفظ أي وش لاسم.")).pack(fill="x", pady=8)
+
+    def who_choose(self) -> None:
+        files = filedialog.askopenfilenames(title=tr("Who is this?", "مين ده؟"),
+                                            filetypes=[(tr("Photos", "صور"),
+                                                        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.heic *.heif"),
+                                                       (tr("All files", "كل الملفات"), "*.*")])
+        if files:
+            self.who_add([Path(f) for f in files])
+
+    def who_add(self, paths: list[Path]) -> None:
+        from .engine import IMAGE_EXTS, find_photos
+        new = []
+        for p in paths:
+            new += find_photos(p)[:200] if p.is_dir() else ([p] if p.suffix.lower() in IMAGE_EXTS else [])
+        for p in new:
+            self.who_paths.append(p)
+            self.who_list.insert("end", p.name)
+        if new:
+            self.show_page("who")
+            self.who_list.selection_clear(0, "end")
+            self.who_list.selection_set(len(self.who_paths) - len(new))
+            self.who_show()
+
+    def who_clear(self) -> None:
+        self.who_paths.clear()
+        self.who_list.delete(0, "end")
+        self.who_result = None
+        self.who_canvas.delete("all")
+        self.who_empty()
+
+    def who_show(self) -> None:
+        sel = self.who_list.curselection()
+        if not sel:
+            return
+        path = self.who_paths[sel[0]]
+        try:
+            if self.engine is None:
+                self.engine = FaceEngine(self.log)
+            img, results = identify(self.lib, self.engine, path)
+        except RuntimeError as e:
+            messagebox.showerror("Face Sorter", str(e))
+            return
+        self.who_result = (path, img, results)
+        self.who_draw()
+        self.who_cards()
+
+    def who_draw(self) -> None:
+        c = self.who_canvas
+        c.delete("all")
+        if not self.who_result:
+            return
+        _, img, results = self.who_result
+        w, h = max(50, c.winfo_width()), max(50, c.winfo_height())
+        ih, iw = img.shape[:2]
+        scale = min(w / iw, h / ih)
+        self._who_photo = photo_from_array(img, int(max(iw, ih) * scale), square=False)
+        sw, sh = self._who_photo.width(), self._who_photo.height()
+        ox, oy = (w - sw) // 2, (h - sh) // 2
+        c.create_image(ox, oy, image=self._who_photo, anchor="nw")
+        for k, r in enumerate(results):
+            x, y, bw, bh = r["box"]
+            x0, y0, x1, y1 = ox + x * scale, oy + y * scale, ox + (x + bw) * scale, oy + (y + bh) * scale
+            color = VERDICT_COLORS[r["verdict"]]
+            c.create_rectangle(x0, y0, x1, y1, outline=color, width=3)
+            label = f"{k + 1}. " + (r["matches"][0][0] if r["matches"] and r["verdict"] != "unknown" else "?")
+            t = c.create_text(x0 + 6, y0 - 12, text=label, anchor="w", fill="#FFFFFF", font=Fonts.bold)
+            bx = c.bbox(t)
+            c.tag_lower(c.create_rectangle(bx[0] - 5, bx[1] - 2, bx[2] + 5, bx[3] + 2, fill=color, outline=color), t)
+
+    def who_cards(self) -> None:
+        for w in self.who_faces.winfo_children():
+            w.destroy()
+        self.who_images = []
+        _, _, results = self.who_result
+        if not results:
+            WrapLabel(self.who_faces, text=tr("No faces found in this photo.", "مفيش وشوش في الصورة دي."),
+                      style="Muted.TLabel").pack(fill="x", pady=8)
+            return
+        names = self.lib.names()
+        for k, r in enumerate(results):
+            card = tk.Frame(self.who_faces, background=C["card"], highlightthickness=1,
+                            highlightbackground=C["border"])
+            card.pack(fill="x", pady=4, padx=2)
+            img = round_thumb(r["crop"], 64)
+            self.who_images.append(img)
+            ttk.Label(card, image=img).pack(side=start(), anchor="n", padx=8, pady=8)
+            inner = ttk.Frame(card)
+            inner.pack(side=start(), fill="x", expand=True, padx=(0, 8) if not rtl() else (8, 0), pady=6)
+            mark = {"sure": "✅", "maybe": "❓", "unknown": "❔"}[r["verdict"]]
+            if r["matches"] and r["verdict"] != "unknown":
+                title = f"{k + 1}. {mark} {r['matches'][0][0]}"
+                text = tr(f"match {r['matches'][0][1]:.2f}", f"التشابه {r['matches'][0][1]:.2f}")
+                if len(r["matches"]) > 1:
+                    text += "\n" + tr("or: ", "أو: ") + ", ".join(f"{n} ({sc:.2f})" for n, sc in r["matches"][1:3])
+            else:
+                title = f"{k + 1}. {mark} " + tr("Unknown", "مش معروف")
+                text = (tr("Seen before: ", "اتشاف قبل كده: ") + str(r["seen_before"])) if r["seen_before"] else ""
+            if not r["good"]:
+                text += ("\n" if text else "") + tr("(low quality)", "(مش واضح)")
+            WrapLabel(inner, text=title, style="Bold.TLabel").pack(fill="x")
+            if text:
+                WrapLabel(inner, text=text, style="Muted.TLabel").pack(fill="x")
+            row = Flow(inner, padx=2)
+            row.pack(fill="x", pady=2)
+            var = tk.StringVar(value=r["matches"][0][0] if r["matches"] and r["verdict"] != "unknown" else "")
+            status = WrapLabel(inner, style="Ok.TLabel")
+
+            def save(r=r, var=var, status=status):
+                msg = self.lib.save_face(var.get(), r["face"])
+                if msg:
+                    status.config(text="✓ " + msg)
+                    self.notify(msg)
+                    self.refresh_card()
+            row.add(ttk.Combobox(row, textvariable=var, values=names, width=12, justify=justify()))
+            row.add(ttk.Button(row, text=tr("Save", "احفظ"), command=save))
+            status.pack(fill="x")
+
+    # ============================================================ page: find
+    def _build_find(self, page) -> None:
+        self.page_head(page, tr("Find people in the photos on this computer", "دوّر على ناس في صور الجهاز ده"), tr(
+            "Choose one person or more: you get every photo on this computer with all of them in it. It uses what "
+            "was found when the photos were scanned, so scan a folder first.",
+            "اختار شخص أو أكتر، وهيطلعلك كل صورة على الجهاز ده هما فيها مع بعض. البحث بيستخدم نتايج فحص الصور، "
+            "فلازم الفولدر يكون اتفحص قبل كده."))
+        body = ttk.PanedWindow(page, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        who = Card(body, tr("Who?", "مين؟"), padding=(12, 10))
+        res = Card(body, tr("Photos", "الصور"), padding=(12, 10))
+        for pane, weight in ((res, 3), (who, 1)) if rtl() else ((who, 1), (res, 3)):
+            body.add(pane, weight=weight)
+        self.find_filter = tk.StringVar()
+        SearchBox(who.body, self.find_filter, tr("Search names", "دوّر بالاسم")).pack(fill="x", pady=(0, 8))
+        self.find_filter.trace_add("write", lambda *_: self.refresh_find_people())
+        self.find_go = ttk.Button(who.body, text=tr("🔎  Find", "🔎  دوّر"), style="Primary.TButton",
+                                  command=self.find_start)
+        self.find_go.pack(side="bottom", fill="x", pady=(8, 0))
+        self.find_picked = WrapLabel(who.body, style="Bold.TLabel")
+        self.find_picked.pack(side="bottom", fill="x", pady=(6, 0))
+        self.find_tree = ttk.Treeview(who.body, show="tree", style="People.Treeview", selectmode="extended")
+        self.find_tree.pack(fill="both", expand=True)
+        self.find_tree.bind("<<TreeviewSelect>>", lambda e: self.find_selection_changed())
+        self.find_tree.bind("<Double-Button-1>", lambda e: self.find_start())
+        self.find_rows: dict[str, int] = {}
+        self.find_imgs: list = []
+        top = Flow(res.body, padx=3)
+        top.pack(fill="x")
+        self.find_summary = ttk.Label(top, style="Bold.TLabel", text="")
+        top.add(self.find_summary)
+        self.find_open = ttk.Button(top, text=tr("Open photo", "افتح الصورة"), command=self.find_open_photo)
+        self.find_folder = ttk.Button(top, text=tr("Open its folder", "افتح فولدرها"), command=self.find_open_folder)
+        self.find_copy = ttk.Button(top, text=tr("Copy all to a folder…", "انسخهم كلهم لفولدر…"),
+                                    command=self.find_copy_all)
+        for b in (self.find_copy, self.find_folder, self.find_open):
+            top.add(b, end=True)
+        self.find_bar = ttk.Progressbar(res.body, maximum=100)
+        self.find_grid = Grid(res.body, size=150, on_click=self.find_click, on_double=lambda k: self.find_open_photo(k),
+                              empty=tr("Choose people on the side, then press Find.",
+                                       "اختار ناس من الجنب، وبعدين دوس دوّر."))
+        self.find_grid.pack(fill="both", expand=True, pady=(8, 0))
+        self.find_selected = -1
+        self.find_buttons_state()
+
+    def refresh_find_people(self) -> None:
+        if not hasattr(self, "find_tree") or not self.find_tree.winfo_exists():
+            return
+        keep = set(self.find_selected_pids())
+        text = self.find_filter.get().strip().lower()
+        self.find_tree.delete(*self.find_tree.get_children())
+        self.find_rows.clear()
+        self.find_imgs.clear()
+        people = self.lib.people("known")
+        for p in people:
+            if text and text not in (p.name or "").lower():
+                continue
+            img = round_thumb(self.lib.thumb(p.id), 36)
+            self.find_imgs.append(img)
+            item = self.find_tree.insert("", "end", text=f"  {p.name}", image=img)
+            self.find_rows[item] = p.id
+            if p.id in keep:
+                self.find_tree.selection_add(item)
+        if not people:
+            self.find_picked.config(text=tr("No named people yet: name people in a review or on the People page.",
+                                            "لسه مفيش ناس متسمّيين: سمّيهم في المراجعة أو في صفحة الناس."))
+            self.find_go.config(state="disabled")
+        else:
+            self.find_selection_changed()
+
+    def find_selected_pids(self) -> list[int]:
+        return [self.find_rows[i] for i in self.find_tree.selection() if i in self.find_rows]
+
+    def find_selection_changed(self) -> None:
+        if not hasattr(self, "find_tree") or not self.find_tree.winfo_exists():
+            return
+        names = [self.find_tree.item(i, "text").strip() for i in self.find_tree.selection()]
+        self.find_picked.config(text=(tr("Together: ", "مع بعض: ") + "، ".join(names)) if names else
+                                tr("Choose one person or more (Ctrl+click for more).",
+                                   "اختار شخص أو أكتر (Ctrl مع الضغط لأكتر من واحد)."))
+        self.find_go.config(state="normal" if names and not self.busy else "disabled")
+
+    def find_start(self) -> None:
+        pids = self.find_selected_pids()
+        if not pids or self.busy:
+            return
+        self.find_job += 1
+        job = self.find_job
+        self.find_results = []
+        self.find_selected = -1
+        self.find_grid.empty = tr("Searching…", "بدوّر…")
+        self.find_grid.set_items([])
+        self.find_summary.config(text=tr("Searching…", "بدوّر…"))
+        self.find_bar.pack(fill="x", pady=(6, 0), before=self.find_grid)
+        self.find_bar["value"] = 0
+        self.find_go.config(state="disabled")
+        lib, strict = self.lib, self.strict_var.get()
+
+        def work():
+            try:
+                found = find_people(lib, pids, strict)
+                self.msgs.put(("find_found", (job, found)))
+                thumbs = []
+                for k, f in enumerate(found[:FIND_LIMIT]):
+                    thumbs.append(photo_thumb(f.path, 150))
+                    if k % 12 == 0:
+                        self.msgs.put(("find_progress", (job, k + 1, min(len(found), FIND_LIMIT))))
+                self.msgs.put(("find_done", (job, found, thumbs)))
+            except Exception as e:
+                log_error("find", traceback.format_exc())
+                self.msgs.put(("find_done", (job, [], [], str(e))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def find_show(self, found, thumbs) -> None:
+        self.find_results = found
+        self.find_bar.pack_forget()
+        sure = sum(1 for f in found if f.sure)
+        if not found:
+            self.find_summary.config(text=tr("No photos found.", "ملقتش صور."))
+            self.find_grid.empty = tr(
+                "No photos on this computer have all these people in them. Only scanned folders are searched: if "
+                "the photos are in a folder that was not scanned yet, scan it from 'This computer' first.",
+                "مفيش صور على الجهاز ده فيها كل الناس دول. البحث في الفولدرات اللي اتفحصت بس: لو الصور في فولدر "
+                "لسه متفحصش، افحصه الأول من «الجهاز ده».")
+        else:
+            more = tr(f" (showing the first {FIND_LIMIT})", f" (بيعرض أول {FIND_LIMIT})") \
+                if len(found) > FIND_LIMIT else ""
+            self.find_summary.config(text=tr(f"{len(found)} photos · {sure} sure · {len(found) - sure} maybe",
+                                             f"{len(found)} صورة · {sure} متأكد · {len(found) - sure} يمكن") + more)
+        items, headers = [], {}
+        order = sorted(range(len(thumbs)), key=lambda k: not found[k].sure)
+        last = None
+        for k in order:
+            f = found[k]
+            group = (f.sure, (f.date or "")[:4])
+            if group != last:
+                year = (f.date or "")[:4] or tr("no date", "من غير تاريخ")
+                headers[len(items)] = (tr("✅ Sure", "✅ متأكد") if f.sure else tr("❓ Maybe", "❓ يمكن")) + f"  ·  {year}"
+                last = group
+            items.append({"key": f"f{self.find_job}_{k}", "img": thumbs[k], "on": None, "idx": k,
+                          "caption": f.date or ""})
+        self.find_grid.set_items(items, headers)
+        self.find_buttons_state()
+        self.find_selection_changed()
+
+    def find_click(self, k: int) -> None:
+        for it in self.find_grid.items:
+            it["on"] = None
+        self.find_grid.items[k]["on"] = True
+        self.find_selected = self.find_grid.items[k]["idx"]
+        self.find_grid.draw()
+        self.find_buttons_state()
+        self.notify(str(self.find_results[self.find_selected].path), "info")
+
+    def find_buttons_state(self) -> None:
+        one = "normal" if self.find_selected >= 0 else "disabled"
+        self.find_open.config(state=one)
+        self.find_folder.config(state=one)
+        self.find_copy.config(state="normal" if self.find_results else "disabled")
+
+    def find_open_photo(self, k: int | None = None) -> None:
+        if k is not None:
+            self.find_click(k)
+        if self.find_selected >= 0:
+            open_path(self.find_results[self.find_selected].path)
+
+    def find_open_folder(self) -> None:
+        if self.find_selected >= 0:
+            open_path(self.find_results[self.find_selected].path.parent)
+
+    def find_copy_all(self) -> None:
+        if not self.find_results:
+            return
+        d = filedialog.askdirectory(title=tr("Copy the photos to", "تنسخ الصور فين"))
+        if not d:
+            return
+        n = 0
+        for f in self.find_results:
+            try:
+                copy_file(f.path, Path(d))
+                n += 1
+            except OSError:
+                pass
+        self.notify(tr(f"Copied {n} photos to {d}", f"اتنسخت {n} صورة في {d}"))
+
+    # ============================================================ page: people
+    def _build_people(self, page) -> None:
+        self.page_head(page, tr("People", "الناس"), tr(
+            "Everyone the library knows. Select people to name, join, isolate, delete or export them; "
+            "click faces to correct them.",
+            "كل اللي المكتبة تعرفهم. حدد ناس عشان تسمّيهم أو تدمجهم أو تعزلهم أو تمسحهم أو تصدّرهم، "
+            "ودوس على الوشوش عشان تصلّحها."))
+        tools = Flow(page, padx=3, style="Page.TFrame")
+        tools.pack(fill="x", pady=(0, 8))
+        self.lib_stats = ttk.Label(tools, style="Page.TLabel", font=Fonts.bold)
+        tools.add(self.lib_stats)
+        self.lib_buttons = []
+        for text, cmd in ((tr("↻ Refresh", "↻ حدّث"), self.refresh_people),
+                          (tr("Reset learning", "امسح التعلم التلقائي"), self.reset_learning),
+                          (tr("Possible duplicates", "يمكن متكررين"), self.open_duplicates)):
+            b = ttk.Button(tools, text=text, command=cmd)
+            tools.add(b, end=True)
+            self.lib_buttons.append(b)
+        body = ttk.PanedWindow(page, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        left = Card(body, padding=(12, 10))
+        right = Card(body, padding=(16, 12))
         for pane, weight in ((right, 5), (left, 2)) if rtl() else ((left, 2), (right, 5)):
             body.add(pane, weight=weight)
 
-        pbar = ttk.Frame(left)
-        pbar.pack(side="bottom", fill="x", pady=4)
-        WrapLabel(pbar, text=tr("Selected people (Ctrl/Shift for more):", "الناس المحددين (Ctrl أو Shift لأكتر من واحد):"),
-                  foreground="#666").pack(fill="x")
-        prow = Flow(pbar, padx=2)
-        prow.pack(fill="x")
-        for text, cmd in ((tr("Name", "سمّي"), self.rename_person),
-                          (tr("Join", "ادمج"), self.join_people),
-                          (tr("Isolate", "اعزل"), self.isolate_people),
-                          (tr("Delete", "امسح"), self.delete_person),
-                          (tr("Export…", "صدّر…"), self.export_people)):
-            b = ttk.Button(prow, text=text, command=cmd)
-            prow.add(b)
-            self.lib_buttons.append(b)
-        self.tree = ttk.Treeview(left, columns=("n", "seen"), style="People.Treeview", selectmode="extended")
+        self.people_filter = tk.StringVar()
+        SearchBox(left.body, self.people_filter, tr("Search", "دوّر بالاسم")).pack(fill="x", pady=(0, 8))
+        self.people_filter.trace_add("write", lambda *_: self.refresh_people())
+        pbar = Flow(left.body, padx=2)
+        pbar.pack(side="bottom", fill="x", pady=(8, 0))
+        b = ttk.Button(pbar, text=tr("✎ Name", "✎ سمّي"), command=self.rename_person)
+        pbar.add(b)
+        self.lib_buttons.append(b)
+        b = menu_button(pbar, tr("With selected", "مع المحددين"), [
+            (tr("Join them into one person…", "ادمجهم في شخص واحد…"), self.join_people),
+            (tr("Isolate (back to unknown)", "اعزلهم (يرجعوا للمجهولين)"), self.isolate_people),
+            (tr("Export to a new library…", "صدّرهم لمكتبة جديدة…"), self.export_people),
+            ("-", None),
+            (tr("Delete…", "امسحهم…"), self.delete_person)])
+        pbar.add(b)
+        self.lib_buttons.append(b)
+        Tip(b, lambda: tr("Ctrl or Shift + click to select several people",
+                          "Ctrl أو Shift مع الضغط عشان تحدد أكتر من شخص"))
+        self.tree = ttk.Treeview(left.body, columns=("n", "seen"), style="People.Treeview", selectmode="extended")
         self.tree.heading("#0", text=tr("Person", "الشخص"), anchor=anchor())
         self.tree.heading("n", text=tr("Faces", "وشوش"))
         self.tree.heading("seen", text=tr("Seen", "اتشاف"))
-        self.tree.column("#0", width=210, stretch=True)
+        self.tree.column("#0", width=190, stretch=True)
         for col, title in (("n", tr("Faces", "وشوش")), ("seen", tr("Seen", "اتشاف"))):
-            self.tree.column(col, width=max(56, self.f_bold.measure(title) + 18), anchor="center", stretch=False)
+            self.tree.column(col, width=max(56, Fonts.bold.measure(title) + 22), anchor="center", stretch=False)
         for lvl, col in LEVEL_COLORS.items():
             self.tree.tag_configure(lvl, foreground=col)
-        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.tag_configure("section", font=Fonts.bold, foreground=C["muted"])
+        sb = ttk.Scrollbar(left.body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side=end(), fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_person())
 
-        self.p_head = WrapLabel(right, font=self.f_head)
+        r = right.body
+        top = ttk.Frame(r)
+        top.pack(fill="x")
+        self.p_face = ttk.Label(top)
+        self.p_face.pack(side=start(), padx=(0, 12) if not rtl() else (12, 0))
+        txt = ttk.Frame(top)
+        txt.pack(side=start(), fill="x", expand=True)
+        self.p_head = WrapLabel(txt, font=Fonts.title)
         self.p_head.pack(fill="x")
-        self.p_info = WrapLabel(right, foreground="#555")
+        self.p_level = Flow(txt, padx=2, pady=2)
+        self.p_level.pack(fill="x")
+        self.p_info = WrapLabel(txt, style="Muted.TLabel")
         self.p_info.pack(fill="x")
-        act = Flow(right, padx=2)
-        act.pack(fill="x", pady=4)
+        act = Flow(r, padx=2)
+        act.pack(fill="x", pady=(8, 4))
         b = ttk.Button(act, text=tr("Not this person", "مش الشخص ده"), command=self.not_this_person)
         act.add(b)
         self.lib_buttons.append(b)
         self.move_var = tk.StringVar()
-        self.move_box = ttk.Combobox(act, textvariable=self.move_var, width=20, justify=justify())
+        self.move_box = ttk.Combobox(act, textvariable=self.move_var, width=18, justify=justify())
         b = ttk.Button(act, text=tr("Move to →", "انقلهم لـ ←"), command=self.move_prints)
         act.add(b, end=True)
         act.add(self.move_box, end=True)
         self.lib_buttons.append(b)
-        self.p_grid = Grid(right, size=88, on_click=self.toggle_print)
+        Tip(act, lambda: tr("Click faces to select them first", "دوس على الوشوش الأول عشان تحددها"))
+        self.p_grid = Grid(r, size=88, on_click=self.toggle_print)
         self.p_grid.pack(fill="both", expand=True)
         self.tree_rows: dict[str, int] = {}
         self.tree_images: list = []
         self.p_selected: set[int] = set()
+        self._p_img = None
 
-    def refresh_library(self) -> None:
+    def refresh_people(self) -> None:
+        if not hasattr(self, "tree") or not self.tree.winfo_exists():
+            return
         lib = self.lib
         st = lib.stats()
         self.lib_stats.config(text=tr(
-            f"{st['known']} people · {st['unknown']} unknown · {st['prints']} face prints · "
-            f"{st['sessions']} visits on {st['devices']} computer(s) · {st['size_mb']} MB",
-            f"{st['known']} شخص · {st['unknown']} مجهول · {st['prints']} بصمة وش · "
-            f"{st['sessions']} زيارة على {st['devices']} جهاز · {st['size_mb']} ميجا"))
+            f"{st['known']} people · {st['unknown']} unknown · {st['prints']} faces",
+            f"{st['known']} شخص · {st['unknown']} مجهول · {st['prints']} وش"))
         keep = self.selected_pid()
+        text = self.people_filter.get().strip().lower()
         self.tree.delete(*self.tree.get_children())
         self.tree_rows.clear()
         self.tree_images.clear()
-        known = lib.people("known")
-        unknown = lib.people("unknown")
-        k = self.tree.insert("", "end", text=tr(f" Known ({len(known)})", f" معروفين ({len(known)})"), open=True)
-        u = self.tree.insert("", "end", text=tr(f" Unknown ({len(unknown)})", f" مجهولين ({len(unknown)})"), open=True)
+        known = [p for p in lib.people("known") if not text or text in (p.name or "").lower()]
+        unknown = [p for p in lib.people("unknown") if not text or text in person_label(p.label).lower()]
+        k = self.tree.insert("", "end", text=tr(f" Known ({len(known)})", f" معروفين ({len(known)})"), open=True,
+                             tags=("section",))
+        u = self.tree.insert("", "end", text=tr(f" Unknown ({len(unknown)})", f" مجهولين ({len(unknown)})"),
+                             open=True, tags=("section",))
         frequent = {p.id for p in lib.frequent_unknowns()}
         reselect = None
         for parent, people in ((k, known), (u, unknown)):
             for p in people:
-                img = photo_from_array(lib.thumb(p.id), 38)
+                img = round_thumb(lib.thumb(p.id), 38)
                 self.tree_images.append(img)
-                text = f" {person_label(p.label)}" + ("  ⭐" if p.id in frequent else "")
-                item = self.tree.insert(parent, "end", text=text, image=img, values=(p.prints, p.seen_count),
+                label = f"  {person_label(p.label)}" + ("  ⭐" if p.id in frequent else "")
+                item = self.tree.insert(parent, "end", text=label, image=img, values=(p.prints, p.seen_count),
                                         tags=(p.level,) if p.kind == "known" else ())
                 self.tree_rows[item] = p.id
                 if p.id == keep:
@@ -1179,15 +1466,82 @@ class App:
             self.tree.see(reselect)
         else:
             self.p_grid.set_items([])
-            self.p_head.config(text=tr("Choose a person", "اختار شخص"))
-            self.p_info.config(text="")
+            self._p_img = None
+            self.p_face.config(image="")
+            self.p_level.clear()
+            if not st["known"] and not st["unknown"]:
+                self.p_head.config(text=tr("No people yet", "لسه مفيش ناس"))
+                self.p_info.config(text=tr("Scan a folder of photos on 'This computer': the program groups the faces "
+                                           "and you name them.",
+                                           "افحص فولدر صور من «الجهاز ده»: البرنامج هيجمّع الوشوش وإنت تسمّيهم."))
+            else:
+                self.p_head.config(text=tr("Choose a person", "اختار شخص"))
+                self.p_info.config(text=tr("Their faces, from the oldest photo to the newest, appear here.",
+                                           "وشوشه هتظهر هنا، من أقدم صورة لأحدث صورة."))
 
     def selected_pid(self) -> int | None:
         pids = self.selected_pids()
         return pids[0] if pids else None
 
     def selected_pids(self) -> list[int]:
+        if not hasattr(self, "tree") or not self.tree.winfo_exists():
+            return []
         return [self.tree_rows[i] for i in self.tree.selection() if i in self.tree_rows]
+
+    def show_person(self) -> None:
+        pid = self.selected_pid()
+        if pid is None:
+            return
+        p = self.lib.person(pid)
+        if p is None:
+            return
+        self.p_selected = set()
+        self._p_img = round_thumb(self.lib.thumb(p.id), 60)
+        self.p_face.config(image=self._p_img)
+        self.p_head.config(text=person_label(p.label))
+        self.p_level.clear()
+        if p.kind == "known":
+            soft = {"weak": "#FEE2E2", "medium": C["warn_soft"], "strong": C["ok_soft"]}[p.level]
+            self.p_level.add(chip(self.p_level, tr("knows them: ", "معرفته بيه: ") + level_text(p.level),
+                                  LEVEL_COLORS[p.level], soft))
+        else:
+            self.p_level.add(chip(self.p_level, tr("no name yet", "لسه من غير اسم"), C["warn"], C["warn_soft"]))
+        self.p_level.add(chip(self.p_level, tr(f"{p.prints} faces", f"{p.prints} وش")))
+        self.p_level.add(chip(self.p_level, tr(f"{p.looks} look(s)", f"{p.looks} شكل")))
+        self.p_level.add(chip(self.p_level, tr(f"seen {p.seen_count}×", f"اتشاف {p.seen_count} مرة")))
+        bits = [tr(f"{p.manual} confirmed + {p.auto} learned by itself",
+                   f"{p.manual} متأكد منهم + {p.auto} اتعلمهم لوحده"),
+                tr("on: ", "على: ") + (", ".join(p.devices) or "-"),
+                tr("last seen: ", "آخر مرة: ") + (p.last_seen or "-")]
+        if p.kind == "unknown":
+            bits.insert(0, tr("Use 'Name' to remember them.", "دوس «سمّي» عشان البرنامج يفتكره."))
+        if p.note:
+            bits.insert(0, p.note)
+        self.p_info.config(text="   ·   ".join(bits))
+        items, headers, last_year = [], {}, None
+        for k, (print_id, crop, date, source, quality, device) in enumerate(self.lib.prints_of(pid)):
+            year = (date or "")[:4] or "?"
+            if year != last_year:
+                headers[k] = year if year != "?" else tr("No date", "من غير تاريخ")
+                last_year = year
+            items.append({"key": f"p{print_id}", "jpg": crop, "on": None, "pid": print_id,
+                          "caption": tr("auto", "تلقائي") if source == "auto" else ""})
+        self.p_grid.set_items(items, headers)
+
+    def toggle_print(self, k: int) -> None:
+        it = self.p_grid.items[k]
+        if it["pid"] in self.p_selected:
+            self.p_selected.discard(it["pid"])
+            it["on"] = None
+        else:
+            self.p_selected.add(it["pid"])
+            it["on"] = False
+        self.p_grid.draw()
+
+    def _changed(self, msg: str) -> None:
+        self.notify(msg)
+        self.refresh_all()
+        self.refresh_people()
 
     def join_people(self) -> None:
         pids = self.selected_pids()
@@ -1223,57 +1577,8 @@ class App:
             return
         dest = Path(d) / f"FaceSorter_Library_export_{datetime.now():%Y-%m-%d_%H%M}"
         path = self.lib.export_people(pids, dest)
-        messagebox.showinfo(tr("Exported", "اتصدّرت"), tr(f"A new library with {len(pids)} people:\n{path}\n\n"
-                                                          "(It has no password.)",
-                                                          f"مكتبة جديدة فيها {len(pids)} شخص:\n{path}\n\n"
-                                                          "(من غير باسورد.)"))
-
-    def show_person(self) -> None:
-        pid = self.selected_pid()
-        if pid is None:
-            return
-        p = self.lib.person(pid)
-        if p is None:
-            return
-        self.p_selected = set()
-        level = tr(f"  ·  knows them: {level_text(p.level)}", f"  ·  معرفته بيه: {level_text(p.level)}") \
-            if p.kind == "known" else ""
-        self.p_head.config(text=f"{person_label(p.label)}{level}")
-        bits = [tr(f"{p.manual} confirmed + {p.auto} learned faces", f"{p.manual} وش متأكد + {p.auto} اتعلم لوحده"),
-                tr(f"{p.looks} look(s)", f"{p.looks} شكل"),
-                tr(f"seen {p.seen_count} times", f"اتشاف {p.seen_count} مرة"),
-                tr("on: ", "على: ") + (", ".join(p.devices) or "-"),
-                tr("last: ", "آخر مرة: ") + (p.last_seen or "-")]
-        if p.kind == "unknown":
-            bits.insert(0, tr("no name yet: use 'Name' to remember them", "لسه من غير اسم: دوس 'سمّي' عشان يفتكره"))
-        if p.note:
-            bits.insert(0, p.note)
-        self.p_info.config(text="   ·   ".join(bits))
-        items, headers, last_year = [], {}, None
-        for k, (print_id, crop, date, source, quality, device) in enumerate(self.lib.prints_of(pid)):
-            year = (date or "")[:4] or "?"
-            if year != last_year:
-                headers[k] = year if year != "?" else tr("No date", "من غير تاريخ")
-                last_year = year
-            items.append({"key": f"p{print_id}", "jpg": crop, "on": None, "pid": print_id,
-                          "caption": tr("auto", "تلقائي") if source == "auto" else ""})
-        self.p_grid.set_items(items, headers)
-
-    def toggle_print(self, k: int) -> None:
-        it = self.p_grid.items[k]
-        if it["pid"] in self.p_selected:
-            self.p_selected.discard(it["pid"])
-            it["on"] = None
-        else:
-            self.p_selected.add(it["pid"])
-            it["on"] = False
-        self.p_grid.draw()
-
-    def _changed(self, msg: str) -> None:
-        if msg:
-            self._append(msg)
-        self.refresh_all()
-        self.refresh_library()
+        self.notify(tr(f"A new library with {len(pids)} people: {path} (no password)",
+                       f"مكتبة جديدة فيها {len(pids)} شخص: {path} (من غير باسورد)"))
 
     def rename_person(self) -> None:
         pid = self.selected_pid()
@@ -1321,210 +1626,206 @@ class App:
             self._changed(tr(f"Reset learning for {who}: {n} faces removed.",
                              f"اتمسح التعلم التلقائي لـ {who}: {n} وش."))
 
-    # ============================================================ who is this? tab
-    def _build_who(self) -> None:
-        f = self.tab_who
-        drop = tk.Canvas(f, height=80, background="#eef4ff", highlightthickness=2, highlightbackground="#89a")
-        drop.pack(fill="x")
-        hint = tr("🖼  Drop photos here, or click to choose", "🖼  اسحب الصور وافلتها هنا، أو دوس عشان تختار") \
-            if TkinterDnD else tr("🖼  Click to choose photos", "🖼  دوس عشان تختار الصور")
-        text_id = drop.create_text(0, 40, text=hint, font=self.f_title, fill="#345")
-        drop.bind("<Configure>", lambda e: drop.coords(text_id, e.width // 2, e.height // 2))
-        drop.bind("<Button-1>", lambda e: self.who_choose())
-        if TkinterDnD:
-            drop.drop_target_register(DND_FILES)
-            drop.dnd_bind("<<Drop>>", lambda e: self.who_add(dropped_paths(self.root, e.data)))
-        bar = Flow(f, padx=3)
-        bar.pack(fill="x", pady=4)
-        bar.add(ttk.Button(bar, text=tr("Choose photos…", "اختار صور…"), command=self.who_choose))
-        bar.add(ttk.Button(bar, text=tr("Clear the list", "امسح القائمة"), command=self.who_clear))
-        bar.add(ttk.Label(bar, foreground="#666", text=tr("Nothing changes in the library unless you press Save.",
-                                                          "المكتبة مش بتتغير غير لما تدوس احفظ.")), end=True)
-        body = ttk.PanedWindow(f, orient="horizontal")
-        body.pack(fill="both", expand=True)
-        self.who_list = tk.Listbox(body, width=16, justify=justify())
-        self.who_list.bind("<<ListboxSelect>>", lambda e: self.who_show())
-        self.who_canvas = tk.Canvas(body, background="#222", highlightthickness=0, width=240)
-        self.who_canvas.bind("<Configure>", lambda e: self.who_draw())
-        right = ttk.Frame(body)
-        panes = [(self.who_list, 1), (self.who_canvas, 3), (right, 2)]
-        for pane, weight in (reversed(panes) if rtl() else panes):
-            body.add(pane, weight=weight)
-        holder = tk.Canvas(right, highlightthickness=0, width=280)
-        sb = ttk.Scrollbar(right, orient="vertical", command=holder.yview)
-        self.who_faces = ttk.Frame(holder)
-        self.who_faces.bind("<Configure>", lambda e: holder.configure(scrollregion=holder.bbox("all")))
-        win_id = holder.create_window((0, 0), window=self.who_faces, anchor="nw")
-        holder.bind("<Configure>", lambda e: holder.itemconfigure(win_id, width=e.width))
-        holder.configure(yscrollcommand=sb.set)
-        sb.pack(side=end(), fill="y")
-        holder.pack(fill="both", expand=True)
-        self.who_paths: list[Path] = []
-        self.who_result = None   # (path, img, results)
-        self.who_images: list = []
+    # ============================================================ page: library
+    def _build_library_page(self, page) -> None:
+        sf = ScrollFrame(page)
+        sf.pack(fill="both", expand=True)
+        f = sf.inner
+        self.page_head(f, tr("The library", "المكتبة"), tr(
+            "The library is one file in the 'Library' folder next to the program. It keeps the people and their faces, "
+            "not your photos, so it can travel on a USB stick.",
+            "المكتبة ملف واحد في فولدر «Library» جنب البرنامج. فيها الناس ووشوشهم، مش صورك، عشان كده تقدر "
+            "تتنقل على فلاشة."))
+        self.lib_grid = ttk.Frame(f, style="Page.TFrame")
+        self.lib_grid.pack(fill="both", expand=True)
+        self.card_buttons = []
 
-    def who_choose(self) -> None:
-        files = filedialog.askopenfilenames(title=tr("Who is this?", "مين ده؟"),
-                                            filetypes=[(tr("Photos", "صور"),
-                                                        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.heic *.heif"),
-                                                       (tr("All files", "كل الملفات"), "*.*")])
-        if files:
-            self.who_add([Path(f) for f in files])
+        file_card = Card(self.lib_grid, tr("📁  The file", "📁  الملف"))
+        self.lp_file = WrapLabel(file_card.body)
+        self.lp_file.pack(fill="x")
+        fb = Flow(file_card.body, padx=3)
+        fb.pack(fill="x", pady=(8, 0))
+        for text, cmd in ((tr("Open folder", "افتح الفولدر"), lambda: open_path(self.lib.folder)),
+                          (tr("Save a copy…", "احفظ نسخة…"), self.card_copy),
+                          (tr("Move…", "انقل…"), self.card_move),
+                          (tr("Open another…", "افتح مكتبة تانية…"), self.card_open_other),
+                          (tr("Default library", "المكتبة الافتراضية"), self.card_default)):
+            b = ttk.Button(fb, text=text, command=cmd)
+            fb.add(b)
+            self.card_buttons.append(b)
+        WrapLabel(file_card.body, style="Muted.TLabel", text=tr(
+            "Tip: drop a library file on the top bar to open it or merge it into this one.",
+            "ممكن تسحب ملف مكتبة وتفلته على الشريط اللي فوق عشان تفتحه أو تدمجه في المكتبة دي.")).pack(
+            fill="x", pady=(8, 0))
 
-    def who_add(self, paths: list[Path]) -> None:
-        from .engine import IMAGE_EXTS, find_photos
-        new = []
-        for p in paths:
-            new += find_photos(p)[:200] if p.is_dir() else ([p] if p.suffix.lower() in IMAGE_EXTS else [])
-        for p in new:
-            self.who_paths.append(p)
-            self.who_list.insert("end", p.name)
-        if new:
-            self.nb.select(self.tab_who)
-            self.who_list.selection_clear(0, "end")
-            self.who_list.selection_set(len(self.who_paths) - len(new))
-            self.who_show()
+        sec = Card(self.lib_grid, tr("🔒  Password", "🔒  الباسورد"))
+        self.lp_lock = WrapLabel(sec.body)
+        self.lp_lock.pack(fill="x")
+        self.lp_lock_btn = ttk.Button(sec.body, command=self.card_password)
+        self.lp_lock_btn.pack(anchor=anchor(), pady=(8, 0))
+        self.card_buttons.append(self.lp_lock_btn)
 
-    def who_clear(self) -> None:
-        self.who_paths.clear()
-        self.who_list.delete(0, "end")
-        self.who_result = None
-        self.who_canvas.delete("all")
-        for w in self.who_faces.winfo_children():
-            w.destroy()
+        space = Card(self.lib_grid, tr("💾  Space", "💾  المساحة"))
+        self.lp_space = tk.Canvas(space.body, height=110, background=C["card"], highlightthickness=0)
+        self.lp_space.pack(fill="x")
+        self.lp_space.bind("<Configure>", lambda e: self.draw_space())
+        b = ttk.Button(space.body, text=tr("Clean…", "نضّف…"), command=self.card_clean)
+        b.pack(anchor=anchor(), pady=(6, 0))
+        self.card_buttons.append(b)
 
-    def who_show(self) -> None:
-        sel = self.who_list.curselection()
-        if not sel:
+        hist = Card(self.lib_grid, tr("🕘  History", "🕘  التاريخ"))
+        self.lp_hist = WrapLabel(hist.body)
+        self.lp_hist.pack(fill="x")
+        hb = Flow(hist.body, padx=3)
+        hb.pack(fill="x", pady=(8, 0))
+        for text, cmd in ((tr("Sessions & undo", "الجلسات والتراجع"), self.open_sessions),
+                          (tr("Log", "السجل"), self.open_log),
+                          (tr("Backups", "النسخ الاحتياطية"), self.open_backups)):
+            b = ttk.Button(hb, text=text, command=cmd)
+            hb.add(b)
+            self.lib_buttons.append(b)
+
+        about = Card(self.lib_grid, tr("ℹ  About", "ℹ  عن البرنامج"))
+        WrapLabel(about.body, text=tr(
+            f"Face Sorter v{__version__}. Free and open source (MIT). Everything runs on this computer: no photo "
+            "or data is uploaded. The library holds face data and names: only use photos you have the right to "
+            "use, and set a password if the library is on a USB stick.",
+            f"Face Sorter v{__version__}. برنامج مجاني ومفتوح المصدر (MIT). كل الشغل على الجهاز ده، ومفيش ولا صورة "
+            "ولا بيانات بتترفع. المكتبة فيها بيانات وشوش وأسامي: استخدم البرنامج على صور ليك حق فيها، وحط "
+            "باسورد لو المكتبة على فلاشة.")).pack(fill="x")
+        b = ttk.Button(about.body, text=tr("Licenses and details", "الرخص والتفاصيل"), command=self.show_about)
+        b.pack(anchor=anchor(), pady=(8, 0))
+        self.lib_cards = [file_card, sec, space, hist, about]
+        self.lib_cols = 0
+        self.lib_grid.bind("<Configure>", lambda e: self.layout_lib_cards(e.width))
+        self.layout_lib_cards(1)
+
+    def layout_lib_cards(self, width: int) -> None:
+        cols = 2 if width >= int(760 * self.zoom) else 1
+        if cols == self.lib_cols:
             return
-        path = self.who_paths[sel[0]]
-        try:
-            if self.engine is None:
-                self.engine = FaceEngine(self.log)
-            img, results = identify(self.lib, self.engine, path)
-        except RuntimeError as e:
-            messagebox.showerror("Face Sorter", str(e))
-            return
-        self.who_result = (path, img, results)
-        self.who_draw()
-        self.who_cards()
+        self.lib_cols = cols
+        for c in self.lib_cards:
+            c.grid_forget()
+        for k in range(2):
+            self.lib_grid.columnconfigure(k, weight=1 if k < cols else 0, uniform="lib" if k < cols else "")
+        for k, c in enumerate(self.lib_cards):
+            col = (k % cols) if not rtl() else (cols - 1 - k % cols)
+            c.grid(row=k // cols, column=col, sticky="nsew", padx=6, pady=6)
 
-    def who_draw(self) -> None:
-        c = self.who_canvas
+    def refresh_library_page(self) -> None:
+        if not hasattr(self, "lp_file") or not self.lp_file.winfo_exists():
+            return
+        lib = self.lib
+        st = lib.stats()
+        default = tr("  (the default library)", "  (المكتبة الافتراضية)") if lib.folder == LIBRARY_DIR.resolve() else ""
+        self.lp_file.config(text=tr(
+            f"{lib.path.name}{default}\nFolder: {lib.folder}\nCreated {lib.created} · updated {lib.updated}",
+            f"{lib.path.name}{default}\nالفولدر: {lib.folder}\nاتعملت {lib.created} · آخر تحديث {lib.updated}"))
+        if lib.encrypted:
+            self.lp_lock.config(text=tr(
+                "This library is encrypted. It opens only with the password or the recovery key.",
+                "المكتبة دي متشفرة، ومش بتتفتح غير بالباسورد أو مفتاح الاسترجاع."), style="Ok.TLabel")
+            self.lp_lock_btn.config(text=tr("Change or remove the password…", "غيّر الباسورد أو شيله…"))
+        else:
+            self.lp_lock.config(text=tr(
+                "No password: anyone with the file can open it. Recommended if the library is on a USB stick.",
+                "من غير باسورد: أي حد معاه الملف يقدر يفتحه. يُفضّل تحط باسورد لو المكتبة على فلاشة."),
+                style="Warn.TLabel")
+            self.lp_lock_btn.config(text=tr("Set a password…", "حط باسورد…"))
+        backups = len(lib.backups())
+        self.lp_hist.config(text=tr(f"{st['sessions']} visits on {st['devices']} computer(s) · {backups} backups",
+                                    f"{st['sessions']} زيارة على {st['devices']} جهاز · {backups} نسخة احتياطية"))
+        self.draw_space()
+
+    def draw_space(self) -> None:
+        c = self.lp_space
+        if not c.winfo_exists():
+            return
         c.delete("all")
-        if not self.who_result:
-            return
-        _, img, results = self.who_result
-        w, h = max(50, c.winfo_width()), max(50, c.winfo_height())
-        ih, iw = img.shape[:2]
-        scale = min(w / iw, h / ih)
-        shown = cv2.resize(img, (max(1, int(iw * scale)), max(1, int(ih * scale))), interpolation=cv2.INTER_AREA)
-        self._who_photo = tk.PhotoImage(data=_png(shown))
-        ox, oy = (w - shown.shape[1]) // 2, (h - shown.shape[0]) // 2
-        c.create_image(ox, oy, image=self._who_photo, anchor="nw")
-        for k, r in enumerate(results):
-            x, y, bw, bh = r["box"]
-            x0, y0, x1, y1 = ox + x * scale, oy + y * scale, ox + (x + bw) * scale, oy + (y + bh) * scale
-            color = VERDICT_COLORS[r["verdict"]]
-            c.create_rectangle(x0, y0, x1, y1, outline=color, width=3)
-            label = f"{k + 1}. " + (r["matches"][0][0] if r["matches"] and r["verdict"] != "unknown" else "?")
-            t = c.create_text(x0 + 4, y0 - 10, text=label, anchor="w", fill="black", font=self.f_bold)
-            bx = c.bbox(t)
-            c.tag_lower(c.create_rectangle(bx[0] - 4, bx[1] - 2, bx[2] + 4, bx[3] + 2, fill=color, outline=color), t)
-
-    def who_cards(self) -> None:
-        for w in self.who_faces.winfo_children():
-            w.destroy()
-        self.who_images = []
-        _, _, results = self.who_result
-        if not results:
-            ttk.Label(self.who_faces, text=tr("No faces found.", "مفيش وشوش."), padding=10).pack(anchor=anchor())
-            return
-        names = self.lib.names()
-        for k, r in enumerate(results):
-            card = ttk.Frame(self.who_faces, padding=6, relief="groove")
-            card.pack(fill="x", pady=3, padx=2)
-            img = photo_from_array(r["crop"], 72)
-            self.who_images.append(img)
-            ttk.Label(card, image=img).pack(side=start(), anchor="n")
-            inner = ttk.Frame(card)
-            inner.pack(side=start(), fill="x", expand=True, padx=6)
-            mark = {"sure": "✅", "maybe": "❓", "unknown": "❔"}[r["verdict"]]
-            if r["matches"] and r["verdict"] != "unknown":
-                text = f"{k + 1}. {mark} {r['matches'][0][0]}  ({r['matches'][0][1]:.2f})"
-                if len(r["matches"]) > 1:
-                    text += "\n" + tr("or: ", "أو: ") + ", ".join(f"{n} ({sc:.2f})" for n, sc in r["matches"][1:3])
-            else:
-                text = f"{k + 1}. {mark} " + tr("Unknown", "مش معروف")
-                if r["seen_before"]:
-                    text += "\n" + tr("Seen before: ", "اتشاف قبل كده: ") + str(r["seen_before"])
-            if not r["good"]:
-                text += "\n" + tr("(low quality)", "(مش واضح)")
-            WrapLabel(inner, text=text).pack(fill="x")
-            row = Flow(inner, padx=2)
-            row.pack(fill="x", pady=2)
-            var = tk.StringVar(value=r["matches"][0][0] if r["matches"] and r["verdict"] != "unknown" else "")
-            status = WrapLabel(inner, foreground="#2a2")
-
-            def save(r=r, var=var, status=status):
-                msg = self.lib.save_face(var.get(), r["face"])
-                if msg:
-                    status.config(text="✓ " + msg)
-                    self._append(msg)
-                    self.refresh_card()
-            row.add(ttk.Combobox(row, textvariable=var, values=names, width=12, justify=justify()))
-            row.add(ttk.Button(row, text=tr("Save", "احفظ"), command=save))
-            status.pack(fill="x")
+        size = self.lib.size_info()
+        parts = [(tr("People", "الأشخاص"), size["people"], C["accent"]),
+                 (tr("Unknown", "المجهولين"), size["unknown"], "#8B5CF6"),
+                 (tr("Scan memory", "ذاكرة الفحص"), size["cache"], "#F59E0B"),
+                 (tr("Backups", "النسخ الاحتياطية"), size["backups"], "#94A3B8")]
+        w = max(100, c.winfo_width())
+        total = sum(p[1] for p in parts)
+        c.create_text(w - 2 if rtl() else 2, 10, anchor=anchor(), font=Fonts.bold, fill=C["text"],
+                      text=tr(f"Library file: {size['file']} MB", f"ملف المكتبة: {size['file']} ميجا"))
+        c.create_rectangle(0, 26, w, 38, fill="#E5EAF2", outline="")
+        x = 0.0
+        for _, mb, color in parts:
+            seg = (w - 2) * mb / total if total > 0 else 0
+            if seg > 0:
+                x0, x1 = (w - x - seg, w - x) if rtl() else (x, x + seg)
+                c.create_rectangle(x0, 26, x1, 38, fill=color, outline="")
+            x += seg
+        col_w = w / 2
+        for k, (name, mb, color) in enumerate(parts):
+            cx = (w - (k % 2) * col_w - 4) if rtl() else ((k % 2) * col_w + 4)
+            yy = 56 + (k // 2) * 24
+            c.create_rectangle(cx - 10 if rtl() else cx, yy - 5, cx if rtl() else cx + 10, yy + 5, fill=color,
+                               outline="")
+            c.create_text(cx - 16 if rtl() else cx + 16, yy, anchor=anchor(), font=Fonts.small, fill=C["text"],
+                          text=f"{name}: {mb} " + tr("MB", "ميجا"))
 
     # ------------------------------------------------------------- small windows
-    def small_window(self, title: str, width: int, height: int) -> tk.Toplevel:
+    def small_window(self, title: str, width: int, height: int) -> tuple[tk.Toplevel, ttk.Frame]:
         win = tk.Toplevel(self.root)
         win.title(title)
+        page_bg_window(win)
         fit_window(win, width, height)
-        return win
+        f = ttk.Frame(win, style="Page.TFrame", padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text=title, style="PageTitle.TLabel").pack(anchor=anchor(), pady=(0, 10))
+        return win, f
 
     def open_duplicates(self) -> None:
         pairs = self.lib.duplicates()
-        win = self.small_window(tr("Possible duplicates", "يمكن نفس الشخص"), 900, 560)
+        win, f = self.small_window(tr("Possible duplicates", "يمكن نفس الشخص"), 920, 600)
         if not pairs:
-            ttk.Label(win, text=tr("No possible duplicates.", "مفيش تكرار."), padding=20).pack()
+            WrapLabel(f, text=tr("No possible duplicates.", "مفيش تكرار."), style="PageSub.TLabel").pack(fill="x")
             return
-        frame = ttk.Frame(win, padding=10)
-        frame.pack(fill="both", expand=True)
+        sf = ScrollFrame(f)
+        sf.pack(fill="both", expand=True)
         win.images = []
         for a, b, score in pairs[:20]:
             pa, pb = self.lib.person(a), self.lib.person(b)
-            row = Flow(frame, padx=3)
-            row.pack(fill="x", pady=2)
+            card = Card(sf.inner, padding=(10, 8))
+            card.pack(fill="x", pady=4)
+            row = Flow(card.body, padx=4)
+            row.pack(fill="x")
             for p in (pa, pb):
-                img = photo_from_array(self.lib.thumb(p.id), 64)
+                img = round_thumb(self.lib.thumb(p.id), 56)
                 win.images.append(img)
                 row.add(ttk.Label(row, image=img))
-                row.add(ttk.Label(row, text=f"{person_label(p.label)} ({p.prints})"))
-            row.add(ttk.Label(row, text=f"{score:.2f}", foreground="#666"))
+                row.add(ttk.Label(row, text=f"{person_label(p.label)} ({p.prints})", style="Bold.TLabel"))
+            row.add(chip(row, tr(f"similar {score:.2f}", f"التشابه {score:.2f}")))
 
-            def merge(src, dst, r=row):
+            def merge(src, dst, r=card):
                 self._changed(self.lib.merge(src, dst))
                 r.destroy()
 
-            def differ(x=a, y=b, r=row):
+            def differ(x=a, y=b, r=card):
                 self.lib.not_duplicate(x, y)
                 r.destroy()
-            row.add(ttk.Button(row, text=tr("Different", "مختلفين"), command=differ), end=True)
+            row.add(ttk.Button(row, text=tr("Different people", "مختلفين"), command=differ), end=True)
             row.add(ttk.Button(row, text=tr("Join into ", "ادمج في ") + person_label(pb.label),
                                command=lambda s=a, d=b: merge(s, d)), end=True)
             row.add(ttk.Button(row, text=tr("Join into ", "ادمج في ") + person_label(pa.label),
                                command=lambda s=b, d=a: merge(s, d)), end=True)
 
     def open_sessions(self) -> None:
-        win = self.small_window(tr("Sessions", "الجلسات"), 900, 560)
-        b = Flow(win, padx=4)
-        b.pack(side="bottom", fill="x", padx=10, pady=8)
-        lst = tk.Listbox(win, height=10, justify=justify())
-        lst.pack(fill="x", padx=10, pady=8)
-        txt = tk.Text(win, wrap="word", height=12)
+        win, f = self.small_window(tr("Sessions", "الجلسات"), 920, 600)
+        b = Flow(f, padx=4, style="Page.TFrame")
+        b.pack(side="bottom", fill="x", pady=(10, 0))
+        card = Card(f, padding=(10, 10))
+        card.pack(fill="both", expand=True)
+        lst = style_tk(tk.Listbox(card.body, height=9, justify=justify(), activestyle="none"))
+        lst.pack(fill="x")
+        txt = style_tk(tk.Text(card.body, wrap="word", height=10, padx=8, pady=6))
         txt.tag_configure("line", justify=justify())
-        txt.pack(fill="both", expand=True, padx=10)
+        txt.pack(fill="both", expand=True, pady=(8, 0))
         sessions = self.lib.sessions()
         for sid, started, device, folder, mode, status, report in sessions:
             lst.insert("end", f"#{sid}  {started or ''}  {device or ''}  {status}  {folder or ''}")
@@ -1547,16 +1848,18 @@ class App:
                     f"تلغي الجلسة رقم {last[0]}؟ كل اللي ضافته للمكتبة هيتشال (وكمان التغييرات اللي بعدها).")):
                 self._changed(self.lib.undo_last_session())
                 win.destroy()
-        b.add(ttk.Button(b, text=tr("Undo last session", "الغي آخر جلسة"), command=undo))
+        b.add(ttk.Button(b, text=tr("Undo last session", "الغي آخر جلسة"), style="Danger.TButton", command=undo))
         b.add(ttk.Button(b, text=tr("Close", "قفل"), command=win.destroy), end=True)
 
     def open_backups(self) -> None:
         backups = self.lib.backups()
-        win = self.small_window(tr("Backups", "النسخ الاحتياطية"), 680, 420)
-        b = Flow(win, padx=4)
-        b.pack(side="bottom", fill="x", padx=10, pady=8)
-        lst = tk.Listbox(win, justify=justify())
-        lst.pack(fill="both", expand=True, padx=10, pady=8)
+        win, f = self.small_window(tr("Backups", "النسخ الاحتياطية"), 700, 460)
+        b = Flow(f, padx=4, style="Page.TFrame")
+        b.pack(side="bottom", fill="x", pady=(10, 0))
+        card = Card(f, padding=(10, 10))
+        card.pack(fill="both", expand=True)
+        lst = style_tk(tk.Listbox(card.body, justify=justify(), activestyle="none"))
+        lst.pack(fill="both", expand=True)
         for bk in backups:
             lst.insert("end", bk.name)
 
@@ -1569,18 +1872,20 @@ class App:
                 self._changed(tr(f"Library restored from {backups[sel[0]].name}",
                                  f"المكتبة رجعت من {backups[sel[0]].name}"))
                 win.destroy()
-        b.add(ttk.Button(b, text=tr("Restore", "رجّع"), command=restore))
+        b.add(ttk.Button(b, text=tr("Restore", "رجّع"), style="Primary.TButton", command=restore))
         b.add(ttk.Button(b, text=tr("Open folder", "افتح الفولدر"), command=lambda: open_path(self.lib.folder)))
         b.add(ttk.Button(b, text=tr("Close", "قفل"), command=win.destroy), end=True)
 
     def open_log(self) -> None:
-        win = self.small_window(tr("Log", "السجل"), 900, 560)
+        win, f = self.small_window(tr("Log", "السجل"), 920, 600)
         kind = tk.StringVar(value="history")
-        top = Flow(win, padx=6)
-        top.pack(fill="x", padx=8, pady=8)
-        txt = tk.Text(win, wrap="word")
+        top = Flow(f, padx=6, style="Page.TFrame")
+        top.pack(fill="x", pady=(0, 8))
+        card = Card(f, padding=(10, 10))
+        card.pack(fill="both", expand=True)
+        txt = style_tk(tk.Text(card.body, wrap="word", padx=8, pady=6, font=Fonts.small))
         txt.tag_configure("line", justify=justify())
-        txt.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        txt.pack(fill="both", expand=True)
 
         def show():
             kinds = {"history": ("history",), "memory": ("memory",), "all": ("history", "memory", "run")}[kind.get()]
@@ -1594,77 +1899,37 @@ class App:
             top.add(ttk.Radiobutton(top, text=label, value=value, variable=kind, command=show))
 
         def save():
-            f = filedialog.asksaveasfilename(parent=win, defaultextension=".txt", initialfile="face_sorter_log.txt")
-            if f:
-                self.lib.export_log(Path(f))
+            fname = filedialog.asksaveasfilename(parent=win, defaultextension=".txt", initialfile="face_sorter_log.txt")
+            if fname:
+                self.lib.export_log(Path(fname))
         top.add(ttk.Button(top, text=tr("Save as text…", "احفظ كملف نص…"), command=save), end=True)
         show()
 
-    # ============================================================ library card
-    def _build_card(self) -> None:
-        card = ttk.Frame(self.ui, padding=(12, 8), style="Card.TFrame")
-        card.pack(fill="x", padx=8, pady=(8, 0))
-        head = ttk.Frame(card)
-        head.pack(fill="x")
-        other = "en" if language() == "ar" else "ar"
-        self.lang_btn = ttk.Button(head, text="🌐 " + LANGUAGES[other], command=self.change_language)
-        self.lang_btn.pack(side=end(), anchor="n")
-        ttk.Label(head, text="📚", font=self.f_title).pack(side=start(), anchor="n")
-        self.card_name = WrapLabel(head, font=self.f_title)
-        self.card_name.pack(side=start(), fill="x", expand=True, padx=6)
-        self.card_path = ttk.Label(card, foreground="#345", anchor=anchor())
-        self.card_path.pack(fill="x", pady=(2, 0))
-        self.card_path.bind("<Configure>", lambda e: self.show_card_path())
-        Tip(self.card_path, lambda: str(self.lib.path) if self.lib else "")
-        self.card_info = WrapLabel(card, foreground="#555")
-        self.card_info.pack(fill="x", pady=(2, 0))
-        self.card_size_text = ""
-        Tip(self.card_info, lambda: self.card_size_text)
-        row = Flow(card, padx=3)
-        row.pack(fill="x", pady=(4, 0))
-        self.card_buttons = []
-        for text, cmd, at_end in ((tr("Open folder", "افتح الفولدر"), lambda: open_path(self.lib.folder), False),
-                                  (tr("Save a copy…", "احفظ نسخة…"), self.card_copy, False),
-                                  (tr("Move…", "انقل…"), self.card_move, False),
-                                  (tr("Open another…", "افتح مكتبة تانية…"), self.card_open_other, False),
-                                  (tr("Default library", "المكتبة الافتراضية"), self.card_default, False),
-                                  (tr("🔒 Password…", "🔒 الباسورد…"), self.card_password, True),
-                                  (tr("Clean…", "نضّف…"), self.card_clean, True)):
-            b = ttk.Button(row, text=text, command=cmd)
-            row.add(b, end=at_end)
-            self.card_buttons.append(b)
-        if TkinterDnD:  # drop a library file on the card to open or merge it
-            for w in (card, self.card_name, self.card_path, self.card_info):
-                w.drop_target_register(DND_FILES)
-                w.dnd_bind("<<Drop>>", lambda e: self.drop_library(e.data))
-
+    # ============================================================ top bar
     def show_card_path(self) -> None:
-        if not self.lib:
+        if not self.lib or not self.card_path.winfo_exists():
             return
         width = self.card_path.winfo_width()
-        font = tkfont.nametofont("TkDefaultFont")
         prefix = tr("Folder: ", "الفولدر: ")
-        self.card_path.config(text=prefix + shorten_middle(str(self.lib.folder), font,
-                                                           width - font.measure(prefix) - 8))
+        self.card_path.config(text=prefix + shorten_middle(str(self.lib.folder), Fonts.body,
+                                                           width - Fonts.body.measure(prefix) - 12))
 
     def refresh_card(self) -> None:
         lib = self.lib
         st, size = lib.stats(), lib.size_info()
-        lock = "  🔒" if lib.encrypted else ""
-        default = tr("  (default)", "  (الافتراضية)") if lib.folder == LIBRARY_DIR.resolve() else ""
-        self.card_name.config(text=f"{lib.path.stem}{lock}{default}")
+        self.card_name.config(text=lib.path.stem)
         self.show_card_path()
-        self.card_info.config(text=tr(
-            f"Created {lib.created}  ·  Updated {lib.updated}  ·  {st['known']} people  ·  {st['unknown']} unknown"
-            f"  ·  {size['file']} MB",
-            f"اتعملت {lib.created}  ·  آخر تحديث {lib.updated}  ·  {st['known']} شخص  ·  {st['unknown']} مجهول"
-            f"  ·  {size['file']} ميجا"))
-        self.card_size_text = tr(
-            f"Size: people {size['people']} MB, unknown {size['unknown']} MB, scan memory {size['cache']} MB, "
-            f"backups {size['backups']} MB",
-            f"الحجم: الأشخاص {size['people']} ميجا، المجهولين {size['unknown']} ميجا، ذاكرة الفحص {size['cache']} ميجا، "
-            f"النسخ الاحتياطية {size['backups']} ميجا")
+        self.chips.clear()
+        if lib.encrypted:
+            self.chips.add(chip(self.chips, tr("🔒 encrypted", "🔒 متشفرة"), C["ok"], C["ok_soft"]))
+        if lib.folder == LIBRARY_DIR.resolve():
+            self.chips.add(chip(self.chips, tr("default", "الافتراضية"), C["accent"], C["accent_soft"]))
+        self.chips.add(chip(self.chips, tr(f"👥 {st['known']} people", f"👥 {st['known']} شخص")))
+        self.chips.add(chip(self.chips, tr(f"❔ {st['unknown']} unknown", f"❔ {st['unknown']} مجهول")))
+        self.chips.add(chip(self.chips, tr(f"💾 {size['file']} MB", f"💾 {size['file']} ميجا")))
+        self.chips.add(chip(self.chips, tr(f"updated {lib.updated}", f"آخر تحديث {lib.updated}")))
 
+    # ============================================================ library operations
     def ask_password(self, where: Path, wrong: bool = False) -> str | None:
         msg = tr(f"{'Wrong password. ' if wrong else ''}This library has a password:\n{where}\n\n"
                  "Type the password or the recovery key.",
@@ -1675,18 +1940,21 @@ class App:
     def choose_file(self, files: list[Path]) -> Path | None:
         win = tk.Toplevel(self.root)
         win.title(tr("Which library?", "أنهي مكتبة؟"))
-        fit_window(win, 760, 340)
+        page_bg_window(win)
+        fit_window(win, 760, 360)
         win.transient(self.root)
         win.grab_set()
-        ttk.Label(win, padding=10, justify=justify(), text=tr(
+        f = ttk.Frame(win, style="Page.TFrame", padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, style="PageSub.TLabel", justify=justify(), text=tr(
             "This folder has more than one library file. Choose one:",
-            "الفولدر فيه أكتر من ملف مكتبة، اختار واحد:")).pack(anchor=anchor())
-        ok_btn = ttk.Button(win, text=tr("Open", "افتح"))
-        ok_btn.pack(side="bottom", pady=8)
-        lst = tk.Listbox(win, justify=justify())
-        lst.pack(fill="both", expand=True, padx=10)
-        for f in files:
-            lst.insert("end", f.name)
+            "الفولدر فيه أكتر من ملف مكتبة، اختار واحد:")).pack(anchor=anchor(), pady=(0, 8))
+        ok_btn = ttk.Button(f, text=tr("Open", "افتح"), style="Primary.TButton")
+        ok_btn.pack(side="bottom", anchor=anchor(), pady=(10, 0))
+        lst = style_tk(tk.Listbox(f, justify=justify(), activestyle="none"))
+        lst.pack(fill="both", expand=True)
+        for p in files:
+            lst.insert("end", p.name)
         chosen: list[Path] = []
 
         def ok():
@@ -1750,15 +2018,15 @@ class App:
         self.settings["library"] = None if lib.folder == LIBRARY_DIR.resolve() else path_setting(lib.folder)
         self.remember()
         self.refresh_all()
-        self.refresh_library()
-        self._append(tr("Library: ", "المكتبة: ") + str(lib.path))
+        self.refresh_people()
+        self.notify(tr("Library: ", "المكتبة: ") + str(lib.path), "info")
 
     def card_copy(self) -> None:
         d = filedialog.askdirectory(title=tr("Where to save the copy", "تحفظ النسخة فين"))
         if d:
             folder = self.lib.copy_to(Path(d))
-            messagebox.showinfo(tr("Saved", "اتحفظت"), tr(f"Copy saved in:\n{folder}\n\nThis library stays where it is.",
-                                                          f"النسخة اتحفظت في:\n{folder}\n\nالمكتبة الأصلية زي ما هي."))
+            self.notify(tr(f"Copy saved in {folder}. This library stays where it is.",
+                           f"النسخة اتحفظت في {folder}. المكتبة الأصلية زي ما هي."))
 
     def card_move(self) -> None:
         d = filedialog.askdirectory(title=tr("Move the library to", "تنقل المكتبة فين"))
@@ -1797,7 +2065,8 @@ class App:
                         "Really remove the password? The library will no longer be encrypted.",
                         "متأكد إنك عايز تشيل الباسورد؟ المكتبة مش هتبقى متشفرة.")):
                     lib.remove_password()
-                    self.refresh_card()
+                    self.refresh_all()
+                    self.notify(tr("Password removed.", "الباسورد اتشال."), "warn")
                 return
         new = simpledialog.askstring(tr("Password", "الباسورد"), tr("New password:", "الباسورد الجديد:"), show="•",
                                      parent=self.root)
@@ -1809,51 +2078,60 @@ class App:
             messagebox.showerror("Face Sorter", tr("The two passwords are different.", "الباسوردين مختلفين."))
             return
         recovery = lib.set_password(new)
-        self.refresh_card()
+        self.refresh_all()
         if recovery:
             self.show_recovery_key(recovery)
         else:
-            messagebox.showinfo(tr("Password", "الباسورد"), tr("Password changed. The recovery key stays the same.",
-                                                               "الباسورد اتغير، ومفتاح الاسترجاع زي ما هو."))
+            self.notify(tr("Password changed. The recovery key stays the same.",
+                           "الباسورد اتغير، ومفتاح الاسترجاع زي ما هو."))
 
     def show_recovery_key(self, key: str) -> None:
         win = tk.Toplevel(self.root)
         win.title(tr("Recovery key", "مفتاح الاسترجاع"))
+        win.configure(background=C["card"])
         win.transient(self.root)
         win.grab_set()
-        ttk.Label(win, padding=12, wraplength=540, justify=justify(), text=tr(
+        f = ttk.Frame(win, padding=20)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text=tr("🔑  Your recovery key", "🔑  مفتاح الاسترجاع بتاعك"), style="CardTitle.TLabel").pack(
+            anchor=anchor())
+        ttk.Label(f, wraplength=540, justify=justify(), text=tr(
             "The library is now encrypted. Keep this recovery key somewhere safe (on paper, NOT on the same USB "
             "stick). If you forget the password, it is the ONLY way to open the library.",
             "المكتبة اتشفرت. احفظ مفتاح الاسترجاع ده في مكان آمن (على ورقة، مش على نفس الفلاشة). لو نسيت "
-            "الباسورد، ده الطريقة الوحيدة لفتح المكتبة.")).pack(anchor=anchor())
-        e = ttk.Entry(win, font=("Courier", 16, "bold"), justify="center", width=32)
+            "الباسورد، ده الطريقة الوحيدة لفتح المكتبة.")).pack(anchor=anchor(), pady=(6, 10))
+        e = ttk.Entry(f, font=("Courier", 16, "bold"), justify="center", width=32)
         e.insert(0, key)
         e.config(state="readonly")
-        e.pack(padx=12, pady=8)
+        e.pack(pady=8)
 
         def copy():
             self.root.clipboard_clear()
             self.root.clipboard_append(key)
 
         def save():
-            f = filedialog.asksaveasfilename(parent=win, defaultextension=".txt",
-                                             initialfile="FaceSorter_recovery_key.txt")
-            if f:
-                Path(f).write_text(f"Face Sorter recovery key for {self.lib.path.name}:\n{key}\n", encoding="utf-8")
-        b = ttk.Frame(win, padding=8)
-        b.pack()
+            fname = filedialog.asksaveasfilename(parent=win, defaultextension=".txt",
+                                                 initialfile="FaceSorter_recovery_key.txt")
+            if fname:
+                Path(fname).write_text(f"Face Sorter recovery key for {self.lib.path.name}:\n{key}\n",
+                                       encoding="utf-8")
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(8, 0))
+        ttk.Button(b, text=tr("I saved it", "حفظته"), style="Primary.TButton", command=win.destroy).pack(
+            side=end())
         ttk.Button(b, text=tr("Copy", "انسخ"), command=copy).pack(side=start(), padx=4)
         ttk.Button(b, text=tr("Save as text…", "احفظه كملف…"), command=save).pack(side=start(), padx=4)
-        ttk.Button(b, text=tr("I saved it", "حفظته"), command=win.destroy).pack(side=start(), padx=4)
         self.root.wait_window(win)
 
     def card_clean(self) -> None:
         size = self.lib.size_info()
         if ask_yes(self.root, tr("Clean", "تنضيف"), tr(
                 f"Forget the scan results of {size['cache_photos']} photos ({size['cache']} MB)?\n"
-                f"No person or face is deleted; photos met again are simply checked again.",
+                f"No person or face is deleted; photos met again are simply checked again. "
+                f"'Find' only searches photos that are scanned.",
                 f"تمسح نتايج فحص {size['cache_photos']} صورة ({size['cache']} ميجا)؟\n"
-                f"مفيش أي شخص أو وش هيتمسح، والصور لو اتقابلت تاني هتتفحص من جديد.")):
+                f"مفيش أي شخص أو وش هيتمسح، والصور لو اتقابلت تاني هتتفحص من جديد. "
+                f"خد بالك إن «دوّر» بيدوّر في الصور اللي اتفحصت بس.")):
             self._changed(self.lib.clean())
 
     def drop_library(self, data: str) -> None:
@@ -1893,14 +2171,12 @@ class App:
         messagebox.showinfo("Face Sorter", tr(
             f"Face Sorter v{__version__}\nFree and open source (MIT license).\n\n"
             "Everything runs on this computer. No photo or data is uploaded.\n"
-            "The library holds face data and names: only use photos you have the right to use, and set a "
-            "password if the library is on a USB stick.\n"
-            "Models: YuNet (MIT) and SFace (Apache-2.0) from OpenCV Zoo. Other licenses: THIRD_PARTY_LICENSES.md",
+            "Models: YuNet (MIT) and SFace (Apache-2.0) from OpenCV Zoo. iPhone photos: libheif and libde265 (LGPL). "
+            "All licenses: THIRD_PARTY_LICENSES.md",
             f"Face Sorter v{__version__}\nبرنامج مجاني ومفتوح المصدر (رخصة MIT).\n\n"
             "كل الشغل بيحصل على الجهاز ده، ومفيش ولا صورة ولا بيانات بتترفع.\n"
-            "المكتبة فيها بيانات وشوش وأسامي: استخدم البرنامج على صور ليك حق فيها، وحط باسورد لو المكتبة "
-            "على فلاشة.\n"
-            "النماذج: YuNet (MIT) و SFace (Apache-2.0) من OpenCV Zoo. باقي الرخص في THIRD_PARTY_LICENSES.md"))
+            "النماذج: YuNet (MIT) و SFace (Apache-2.0) من OpenCV Zoo. صور الآيفون: libheif و libde265 (LGPL). "
+            "كل الرخص في THIRD_PARTY_LICENSES.md"))
 
     def on_error(self, exc, val, tb) -> None:
         text = "".join(traceback.format_exception(exc, val, tb))
@@ -1917,6 +2193,8 @@ class App:
 
     def _append(self, text: str) -> None:
         self.logbox.config(state="normal")
+        if self.logbox.tag_ranges("hint"):  # the first real line replaces the hint
+            self.logbox.delete("1.0", "end")
         self.logbox.insert("end", text + "\n", "line")
         self.logbox.see("end")
         self.logbox.config(state="disabled")
@@ -1929,24 +2207,26 @@ class App:
                 "others": self.others_var.get(), "speed": self.speed_var.get(),
                 "battery_saver": self.battery_var.get(), "skip_screenshots": self.f_shots.get(),
                 "skip_stickers": self.f_stickers.get(), "skip_small": self.f_small.get(),
-                "exclude": self.f_exclude.get(), "language": language()})
+                "exclude": self.f_exclude.get(), "language": language(), "settings_shown": self.settings_shown})
             SETTINGS.write_text(json.dumps(self.settings, ensure_ascii=False, indent=1), encoding="utf-8")
-        except (OSError, ValueError, tk.TclError):
+        except (OSError, ValueError, tk.TclError, AttributeError):
             pass
 
     def refresh_all(self) -> None:
         self.refresh_card()
-        self.lib_label.config(text=tr(f"Photos on this computer ({device_name()}):",
-                                      f"الصور اللي على الجهاز ده ({device_name()}):"))
+        self.device_chip.config(text=tr("This computer: ", "الجهاز ده: ") + device_name())
         pending = pending_session(self.lib)
         self.resume_btn.config(state="normal" if pending and not self.busy else "disabled")
-        if self.nb.select() == str(self.tab_lib):
-            self.refresh_library()
+        if self.page == "people":
+            self.refresh_people()
+        elif self.page == "library":
+            self.refresh_library_page()
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
         for b in [self.start_btn, self.who_btn, self.resume_btn, self.lang_btn] + self.lib_buttons + self.card_buttons:
-            b.config(state="disabled" if busy else "normal")
+            if b.winfo_exists():
+                b.config(state="disabled" if busy else "normal")
         self.stop_btn.config(state="normal" if busy else "disabled")
         self.pause_btn.config(state="normal" if busy else "disabled", text=tr("⏸ Pause", "⏸ إيقاف مؤقت"))
         if busy:
@@ -1957,6 +2237,7 @@ class App:
             self.stage_start = (0, self.started, 0)
         else:
             self.refresh_all()
+            self.find_selection_changed()
 
     def run_job(self, job) -> None:
         def work():
@@ -2008,14 +2289,31 @@ class App:
             elif kind == "review":
                 self.open_review(val)
             elif kind == "report":
+                self.notify(val)
                 messagebox.showinfo(tr("Saved", "اتحفظ"), val)
             elif kind == "done":
                 self.bar["value"] = 100
                 self.progress_label.config(text="100% · " + tr("Done", "خلص"))
                 self.time_label.config(text=f"⏱ {fmt_time(time.monotonic() - self.started)}")
                 self.set_busy(False)
+            elif kind == "find_found":
+                job, found = val
+                if job == self.find_job:
+                    self.find_summary.config(text=tr(f"{len(found)} photos · loading pictures…",
+                                                     f"{len(found)} صورة · بحمّل الصور…"))
+            elif kind == "find_progress":
+                job, k, n = val
+                if job == self.find_job and n:
+                    self.find_bar["value"] = 100 * k / n
+            elif kind == "find_done":
+                job, found, thumbs, *err = val
+                if job == self.find_job and self.find_grid.winfo_exists():
+                    self.find_show(found, thumbs)
+                    if err:
+                        self.notify(err[0], "error")
             else:
                 self.set_busy(False)
+                self.notify(str(val).split("\n")[0], "error")
                 messagebox.showerror("Face Sorter", val)
         self.update_progress()
         self.root.after(150, self.pump)

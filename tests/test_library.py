@@ -38,7 +38,9 @@ def face(b: np.ndarray, key: str, noise: float = 0.15) -> dict:
             "device": "TEST-PC", "crop": encode_jpg(np.full((112, 112, 3), 120, np.uint8), 75)}
 
 
-class LibraryTest(unittest.TestCase):
+class LibraryCase(unittest.TestCase):
+    """A fresh, empty library in a temporary folder for each test."""
+
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
         self.lib = Library(self.dir / "Library")
@@ -58,6 +60,8 @@ class LibraryTest(unittest.TestCase):
         self.lib.changed()
         return pid
 
+
+class LibraryTest(LibraryCase):
     # ------------------------------------------------------------ the file
     def test_new_library_has_a_dated_name(self) -> None:
         self.assertTrue(store.parse_name(self.lib.path), self.lib.path.name)
@@ -224,6 +228,47 @@ class LibraryTest(unittest.TestCase):
         (box, score, emb, crop, q, good, why), = cache_unpack(old)
         self.assertEqual((tuple(int(v) for v in box), emb, crop, good), ((1, 2, 3, 4), b"e", b"c", True))
         self.assertAlmostEqual(float(score), 0.9, places=5)
+
+
+class FindTest(LibraryCase):
+    """'Find': photos on this computer with all the chosen people in them, from saved scan results."""
+
+    def photo(self, name: str, people: list[np.ndarray], date: str, exists: bool = True) -> str:
+        path = self.dir / name
+        if exists:
+            path.write_bytes(b"x")
+        sha1 = name
+        faces = [((0, 0, 50, 50), 0.99, face(b, "q", noise=0.05)["emb"].tobytes(), b"", 0.9, True, "") for b in people]
+        self.lib.db.execute("INSERT INTO photo_cache(sha1, date, status, faces) VALUES(?,?,?,?)",
+                            (sha1, date, "faces" if faces else "no_faces", cache_pack(faces) if faces else None))
+        self.lib.db.execute("INSERT INTO seen(device, path, size, mtime, sha1) VALUES(?,?,?,?,?)",
+                            ("TEST-PC", str(path), 1, 1.0, sha1))
+        return sha1
+
+    def test_find_people_together(self) -> None:
+        from facesorter.session import find_people
+        a_base, b_base, c_base = base(), base(), base()
+        a, b = self.person("A", b=a_base), self.person("B", b=b_base)
+        self.photo("both.jpg", [a_base, b_base], "2024-01-01")
+        self.photo("only_a.jpg", [a_base, c_base], "2024-02-01")
+        self.photo("gone.jpg", [a_base, b_base], "2024-03-01", exists=False)
+        self.photo("nobody.jpg", [c_base], "2024-04-01")
+        self.lib.db.commit()
+        self.assertEqual([f.path.name for f in find_people(self.lib, [a], device="TEST-PC")],
+                         ["only_a.jpg", "both.jpg"])  # newest first, the deleted photo is left out
+        together = find_people(self.lib, [a, b], device="TEST-PC")
+        self.assertEqual([f.path.name for f in together], ["both.jpg"])
+        self.assertTrue(together[0].sure)
+        self.assertEqual(find_people(self.lib, [a], device="OTHER-PC"), [])
+
+    def test_a_confirmed_face_counts_even_if_unclear(self) -> None:
+        from facesorter.session import find_people
+        a = self.person("A")
+        sha1 = self.photo("blurry.jpg", [base()], "2024-05-05")   # looks like nobody known...
+        self.lib.add_prints(a, [face(base(), "sha1:" + sha1)], "manual")   # ...but you confirmed it was A
+        self.lib.changed()
+        found = find_people(self.lib, [a], device="TEST-PC")
+        self.assertEqual([(f.path.name, f.people[a]) for f in found], [("blurry.jpg", "confirmed")])
 
 
 class OldLibraryTest(unittest.TestCase):

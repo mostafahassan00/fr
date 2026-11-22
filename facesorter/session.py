@@ -515,3 +515,61 @@ def identify(lib: Library, engine, path: Path) -> tuple[np.ndarray | None, list[
                     "face": {"emb": f.embedding, "crop": encode_jpg(f.crop), "quality": f.quality,
                              "key": "sha1:" + sha1, "date": date or file_date(path), "device": device_name()}})
     return img, out
+
+
+# ------------------------------------------------------------------ find people
+@dataclass
+class Found:
+    path: Path
+    date: str | None
+    sure: bool                 # every chosen person is surely in it (confirmed, or recognised "sure")
+    people: dict[int, str]     # person id -> "confirmed" / "sure" / "maybe"
+
+
+def find_people(lib: Library, pids: list[int], strictness: int = 5, device: str | None = None,
+                progress: Progress = lambda *a: None) -> list[Found]:
+    """Photos on this computer with ALL of these people in them, from the saved scan results
+    (photos are not opened again). Newest first. Photos that were moved or deleted are left out."""
+    device = device or device_name()
+    pids = list(dict.fromkeys(pids))
+    if not pids:
+        return []
+    base = similarity_for(strictness)
+    with lib.lock:
+        rows = lib.db.execute("SELECT s.path, s.sha1, c.date, c.faces FROM seen s JOIN photo_cache c ON c.sha1=s.sha1 "
+                              "WHERE s.device=? AND c.status='faces'", (device,)).fetchall()
+        q = ",".join("?" * len(pids))
+        confirmed: dict[str, set[int]] = {}
+        for key, pid in lib.db.execute(f"SELECT photo_key, person_id FROM prints WHERE person_id IN ({q}) "
+                                       f"AND source IN ('manual','auto')", pids):
+            if key and key.startswith("sha1:"):
+                confirmed.setdefault(key[5:], set()).add(pid)
+    faces_of: list[tuple[int, np.ndarray]] = []   # (row index, print)
+    for k, (_, _, _, blob) in enumerate(rows):
+        for _box, _score, emb, *_ in cache_unpack(blob):
+            faces_of.append((k, np.frombuffer(emb, np.float32)))
+        if k % 500 == 0:
+            progress(1, k, len(rows))
+    found_in: dict[int, dict[int, str]] = {}
+    if faces_of:
+        matches = lib.match_known(np.array([e for _, e in faces_of], np.float32), top=1)
+        for (k, _), m in zip(faces_of, matches):
+            if not m:
+                continue
+            pid, _name, score = m[0]
+            if pid in pids and score >= base + MAYBE_MARGIN:
+                level = "sure" if score >= base + SURE_MARGIN else "maybe"
+                have = found_in.setdefault(k, {})
+                if have.get(pid) != "sure":
+                    have[pid] = level
+    out = []
+    for k, (path, sha1, date, _) in enumerate(rows):
+        people = dict(found_in.get(k, {}))
+        for pid in confirmed.get(sha1, ()):
+            people[pid] = "confirmed"
+        if all(pid in people for pid in pids) and Path(path).exists():
+            out.append(Found(Path(path), date, all(people[x] != "maybe" for x in pids), people))
+    progress(1, len(rows), len(rows))
+    out.sort(key=lambda f: (f.date or "", str(f.path)), reverse=True)
+    return out
+

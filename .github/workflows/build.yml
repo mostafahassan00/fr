@@ -59,6 +59,9 @@ jobs:
           Invoke-WebRequest https://raw.githubusercontent.com/scikit-image/scikit-image/v0.24.0/skimage/data/astronaut.png -OutFile sample.png
           $env:PATH = "C:\Windows\System32;C:\Windows"
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
+          # the library: people, password, backups, undo, export, merge, old libraries, iPhone photos, find
+          dist/FaceSorter/python/python.exe -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           dist/FaceSorter/python/python.exe build/selftest.py dist sample.png
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # the real window, Arabic and English, at 100% / 125% / 150% zoom: nothing may be cut or hidden

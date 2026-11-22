@@ -57,7 +57,7 @@ def on_error(exc, val, tb):
 gui.App.on_error = lambda self, exc, val, tb: on_error(exc, val, tb)
 app = gui.App()
 r = app.root
-r.after(240000, lambda: (found.append("timeout: the test took too long"), r.destroy()))
+r.after(280000, lambda: (found.append("timeout: the test took too long"), r.destroy()))
 
 def settle():
     for _ in range(10):
@@ -74,20 +74,40 @@ def steps():
     r.state("normal")
     r.geometry(f"{W}x{H}+0+0")
     settle()
-    r.after(400)  # let the settings fold themselves if the window is short
-    settle()
-    for tab in (app.tab_pc, app.tab_who, app.tab_lib):
-        app.nb.select(tab)
-        check("tab " + app.nb.tab(tab, "text").strip(), r)
+    for key in gui.PAGES:   # empty library: the pages say what to do first
+        app.show_page(key)
+        check("empty library, page " + key, r)
     sid = session.scan(app.lib, photos, gui.Filters(min_side=0))
     review = session.build_review(app.lib, sid, min_photos=1)
     rw = gui.ReviewWindow(app, review, "learn", None)
     rw.geometry(f"{W}x{H}+0+0")
     check("review window", rw)
     rw.destroy()
-    session.discard_session(app.lib, sid)
+    for g in review.groups:
+        g.name, g.touched = "Test Person", True
+    session.save_review(app.lib, review, "learn")
+    app.refresh_all()
+    for key in gui.PAGES:   # a library with someone in it
+        app.show_page(key)
+        if key == "people" and app.tree_rows:
+            app.tree.selection_set(next(iter(app.tree_rows)))
+        if key == "find" and app.find_rows:
+            app.find_tree.selection_set(next(iter(app.find_rows)))
+            app.find_start()
+            for _ in range(100):
+                settle()
+                if app.find_results:
+                    break
+            if not app.find_results:
+                found.append("find: the photos of Test Person were not found")
+        check("page " + key, r)
     app.who_add([photos / "photo_1.jpg"])
-    check("who is this", r)
+    check("who is this, with a photo", r)
+    app.show_settings(True, False)
+    app.show_page("scan")
+    app.mode_var.set("learn_sort")
+    app.mode_changed()
+    check("scan page, advanced settings open, 'learn + sort'", r)
     for opener in (app.open_sessions, app.open_log, app.open_backups, app.open_duplicates):
         before = set(r.winfo_children())
         opener()
@@ -96,9 +116,9 @@ def steps():
             w.destroy()
     app.change_language()
     r.geometry(f"{W}x{H}+0+0")
-    for tab in (app.tab_pc, app.tab_who, app.tab_lib):
-        app.nb.select(tab)
-        check("after switching language: " + app.nb.tab(tab, "text").strip(), r)
+    for key in gui.PAGES:
+        app.show_page(key)
+        check("after switching language: page " + key, r)
     r.destroy()
 
 def safe_steps():

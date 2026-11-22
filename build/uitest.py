@@ -32,6 +32,8 @@ for s in range(1, 5):
 
 CHILD = r"""
 import sys, time
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 photos, W, H = Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
@@ -115,7 +117,8 @@ failed = False
 for lang in ("ar", "en"):
     for scale in ("1.0", "1.25", "1.5"):
         lib = work / f"lib_{lang}_{scale}"
-        env = dict(os.environ, FACE_SORTER_LIBRARY=str(lib), FACE_SORTER_LANGUAGE=lang, FACE_SORTER_UI_SCALE=scale)
+        env = dict(os.environ, FACE_SORTER_LIBRARY=str(lib), FACE_SORTER_LANGUAGE=lang, FACE_SORTER_UI_SCALE=scale,
+                   PYTHONIOENCODING="utf-8")
         print(f"== {lang} at {float(scale):.0%}, 1024x700")
         print("   starting...", flush=True)
         try:

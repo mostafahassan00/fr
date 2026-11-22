@@ -3,3 +3,4 @@ numpy
 psutil
 sqlcipher3-wheels
 tkinterdnd2
+pi-heif

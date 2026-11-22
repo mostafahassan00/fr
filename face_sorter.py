@@ -14,6 +14,8 @@ Command line (mostly for automation and tests):
     python face_sorter.py sessions              visits and their reports
     python face_sorter.py undo                  undo the last saved session
     python face_sorter.py log                   history
+    python face_sorter.py accuracy FOLDER       how accurate is recognition on your photos
+                                      (one folder per person; see facesorter/accuracy.py)
 
 Every command takes --library DIR (default: the Library folder next to the program folder).
 """
@@ -80,7 +82,19 @@ def main() -> None:
     w.add_argument("photo", type=Path)
     for cmd in ("duplicates", "sessions", "undo", "log"):
         sub.add_parser(cmd)
+    a = sub.add_parser("accuracy", help="measure recognition on a folder with one folder per person")
+    a.add_argument("folder", type=Path)
+    a.add_argument("--learn", type=int, default=0, help="photos to learn from per person (default: half)")
+    a.add_argument("--strictness", type=int, default=5, help="strictness for the per-person lines")
     args = ap.parse_args()
+
+    if args.cmd == "accuracy":  # uses its own throw-away library, never yours
+        from facesorter import accuracy
+        try:
+            print(accuracy.report(accuracy.measure(args.folder, args.learn, args.strictness), args.strictness))
+        except RuntimeError as err:
+            sys.exit(f"Error: {err}")
+        return
 
     lib = Library(args.library)
     try:

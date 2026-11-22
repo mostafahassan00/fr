@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import io
 import pickle
+import struct
 import shutil
 import socket
 import threading
@@ -519,7 +521,7 @@ class Library:
                 self.db.execute("UPDATE people SET name=?, kind='known', note=NULL WHERE id=?", (new_name, pid))
                 if row[1] == "unknown":  # you named it: its faces are now confirmed
                     self.db.execute("UPDATE prints SET source='manual' WHERE person_id=?", (pid,))
-                msg = f"'{label}' is now '{new_name}'"
+                msg = tr(f"'{label}' is now '{new_name}'", f"'{person_label(label)}' بقى اسمه '{new_name}'")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -542,7 +544,8 @@ class Library:
                             (a[2] or 0, "|".join(devs), into))
             self.db.execute("DELETE FROM people WHERE id=?", (pid,))
             self._trim(into)
-            msg = f"'{a[0] or f'Unknown_{pid:04d}'}' merged into '{b[0] or f'Unknown_{into:04d}'}'"
+            la, lb = a[0] or person_label(f"Unknown_{pid:04d}"), b[0] or person_label(f"Unknown_{into:04d}")
+            msg = tr(f"'{la}' merged into '{lb}'", f"'{la}' اتدمج في '{lb}'")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -570,7 +573,7 @@ class Library:
                                   f"WHERE r.id IN ({q}) LIMIT 1", print_ids).fetchone()
             n = self.db.execute(f"UPDATE prints SET person_id=NULL, source='unknown' WHERE id IN ({q})",
                                 print_ids).rowcount
-            msg = f"{n} face(s) removed from '{row[0] if row else '?'}'"
+            msg = tr(f"{n} face(s) removed from '{row[0] if row else '?'}'", f"{n} وش اتشال من '{row[0] if row else '?'}'")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -585,7 +588,7 @@ class Library:
             n = self.db.execute(f"UPDATE prints SET person_id=?, source='manual' WHERE id IN ({q})",
                                 [target, *print_ids]).rowcount
             self._trim(target)
-            msg = f"{n} face(s) moved to '{name.strip()}'"
+            msg = tr(f"{n} face(s) moved to '{name.strip()}'", f"{n} وش اتنقل لـ '{name.strip()}'")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -688,7 +691,7 @@ class Library:
                 if not row or row[1] != "known":
                     continue
                 self.db.execute("UPDATE people SET name=NULL, kind='unknown', note=? WHERE id=?",
-                                (f"isolated from {row[0]}", pid))
+                                (tr(f"isolated from {row[0]}", f"اتعزل من {row[0]}"), pid))
                 self.db.execute("UPDATE prints SET source='unknown' WHERE person_id=?", (pid,))
                 done.append(row[0])
             if not done:
@@ -711,7 +714,7 @@ class Library:
             for pid in pids:
                 if pid != target:
                     self.merge(pid, target)
-            msg = f"{len(pids)} people joined as '{name}'"
+            msg = tr(f"{len(pids)} people joined as '{name}'", f"{len(pids)} شخص اتجمعوا باسم '{name}'")
             self.log("memory", msg)
             self.changed()
             return msg
@@ -782,8 +785,10 @@ class Library:
                     self.db.execute("INSERT INTO prints(person_id, emb, crop, quality, source, photo_key, photo_date, "
                                     "device, added) VALUES(NULL,?,?,?,?,?,?,?,?)", row)
                 self._trim(None)
-                self.db.executemany("INSERT OR IGNORE INTO photo_cache(sha1, date, status, faces) VALUES(?,?,?,?)",
-                                    o.db.execute("SELECT sha1, date, status, faces FROM photo_cache").fetchall())
+                self.db.executemany(  # scan results come in as plain data only (see cache_pack)
+                    "INSERT OR IGNORE INTO photo_cache(sha1, date, status, faces) VALUES(?,?,?,?)",
+                    [(sha1, date, status, cache_pack(cache_unpack(faces)) if faces else None)
+                     for sha1, date, status, faces in o.db.execute("SELECT sha1, date, status, faces FROM photo_cache")])
                 self.db.executemany("INSERT OR IGNORE INTO seen(device, path, size, mtime, sha1) VALUES(?,?,?,?,?)",
                                     o.db.execute("SELECT device, path, size, mtime, sha1 FROM seen").fetchall())
                 msg = tr(f"Merged {o.path.name}: {people} new people, {added} faces added",
@@ -879,12 +884,54 @@ class Library:
         self.db.close()
 
 
+CACHE_MAGIC = b"FSC1"
+
+
 def cache_pack(faces) -> bytes:
-    return pickle.dumps(faces, protocol=4)
+    """Scan results of one photo: [(box, score, embedding bytes, crop jpg bytes, quality, good, why)].
+
+    Stored as plain data (a small JSON header + the raw bytes), never as code, so a library file
+    from someone else cannot run anything on this computer when it is opened or merged.
+    """
+    head, body = [], []
+    for box, score, emb, crop, q, good, why in faces:
+        emb, crop = bytes(emb), bytes(crop or b"")
+        head.append({"b": [int(v) for v in box], "s": float(score), "q": float(q), "g": bool(good),
+                     "w": str(why or ""), "e": len(emb), "c": len(crop)})
+        body += [emb, crop]
+    h = json.dumps(head, separators=(",", ":")).encode()
+    return CACHE_MAGIC + struct.pack("<I", len(h)) + h + b"".join(body)
+
+
+class _SafeUnpickler(pickle.Unpickler):
+    """Reads scan results saved by v3.2 and older (pickle) without ever running code from the file."""
+    ALLOWED = {("numpy", "dtype"), ("numpy.core.multiarray", "scalar"), ("numpy._core.multiarray", "scalar")}
+
+    def find_class(self, module, name):
+        if (module, name) in self.ALLOWED:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"not allowed in a library file: {module}.{name}")
 
 
 def cache_unpack(blob: bytes | None) -> list:
-    return pickle.loads(blob) if blob else []
+    if not blob:
+        return []
+    blob = bytes(blob)
+    if blob.startswith(CACHE_MAGIC):
+        n = struct.unpack("<I", blob[4:8])[0]
+        head = json.loads(blob[8:8 + n])
+        pos, out = 8 + n, []
+        for f in head:
+            emb = blob[pos:pos + f["e"]]
+            pos += f["e"]
+            crop = blob[pos:pos + f["c"]]
+            pos += f["c"]
+            out.append((tuple(f["b"]), f["s"], emb, crop, f["q"], f["g"], f["w"]))
+        return out
+    try:  # older libraries
+        return [tuple(x) for x in _SafeUnpickler(io.BytesIO(blob)).load()]
+    except Exception:
+        return []  # unreadable: the photo is simply checked again
 
 
 def copy_file(src: Path, folder: Path) -> Path:

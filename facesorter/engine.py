@@ -35,6 +35,12 @@ MODELS = {
 }
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+HEIF_EXTS = {".heic", ".heif", ".hif"}   # iPhone photos (read with pi-heif, when it is installed)
+try:
+    import pi_heif
+    IMAGE_EXTS |= HEIF_EXTS
+except ImportError:  # pragma: no cover - the portable build has it
+    pi_heif = None
 MAX_SIDE = 1920        # big photos are shrunk to this before looking for faces
 MIN_FACE = 36          # faces smaller than this (pixels) are too small to recognise at all
 DETECT_SCORE = 0.80    # how sure the detector must be that something is a face
@@ -146,6 +152,9 @@ def read_photo(path: Path) -> tuple[str | None, np.ndarray | None, str | None]:
         return None, None, None
     raw = data.tobytes()
     sha1 = hashlib.sha1(raw).hexdigest()
+    if path.suffix.lower() in HEIF_EXTS or raw[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1", b"ftyphevc"):
+        img, date = read_heif(raw)
+        return sha1, shrink(img) if img is not None else None, date
     date = exif_date(raw)
     img = None
     if len(data) > BIG_FILE and path.suffix.lower() in (".jpg", ".jpeg"):
@@ -156,11 +165,32 @@ def read_photo(path: Path) -> tuple[str | None, np.ndarray | None, str | None]:
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         return sha1, None, date
+    return sha1, shrink(img), date
+
+
+def shrink(img: np.ndarray) -> np.ndarray:
     h, w = img.shape[:2]
     scale = MAX_SIDE / max(h, w)
     if scale < 1:
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    return sha1, img, date
+    return img
+
+
+def read_heif(raw: bytes) -> tuple[np.ndarray | None, str | None]:
+    """An iPhone photo (HEIC / HEIF): the picture (turned the right way up) and the date it was taken."""
+    if pi_heif is None:
+        return None, None
+    try:
+        import io
+        heif = pi_heif.open_heif(io.BytesIO(raw), convert_hdr_to_8bit=True)
+        img = np.asarray(heif)
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR if img.shape[2] == 4 else cv2.COLOR_RGB2BGR)
+        exif = heif.info.get("exif") or b""
+        start = exif.find(b"Exif\x00\x00")
+        date = _tiff_date(exif[start + 6:]) if start >= 0 else None
+        return img, date
+    except Exception:
+        return None, None
 
 
 def exif_date(raw: bytes) -> str | None:

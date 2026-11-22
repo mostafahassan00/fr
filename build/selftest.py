@@ -6,6 +6,7 @@ Makes two folders of slightly different copies of the face, then uses the
 portable Face Sorter (its own Python, no system Python) to:
 learn the person, name them, recognise them in new photos, and answer "who is this?".
 """
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,8 +57,17 @@ out = run("scan", str(work / "pc2"), "--keep-small", "--mode", "learn_sort", "--
 assert "Recognised: Test Person" in out, "did not recognise the person on the second visit"
 assert (work / "sorted" / "Test Person").is_dir(), "sorted folder missing"
 assert "Test Person" in run("who", str(work / "pc2" / "photo_11.jpg")), "who-is-this failed"
+heic = Path(__file__).resolve().parent.parent / "tests" / "data" / "astronaut.heic"
+assert "Test Person" in run("who", str(heic)), "iPhone photo (HEIC) not recognised"
 assert "Test Person" in run("people")
 run("undo")
+
+acc = work / "accuracy" / "Test Person"   # the accuracy tool, on the same made-up photos
+acc.mkdir(parents=True)
+for f in list((work / "pc1").glob("*.jpg")) + list((work / "pc2").glob("*.jpg")):
+    shutil.copy2(f, acc / f.name)
+out = run("accuracy", str(work / "accuracy"))
+assert "Best strictness with no wrong 'sure'" in out, "accuracy tool failed"
 
 ENC = r"""
 import sys; sys.path.insert(0, sys.argv[1])

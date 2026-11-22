@@ -1366,7 +1366,7 @@ class App:
     def who_choose(self) -> None:
         files = filedialog.askopenfilenames(title=tr("Who is this?", "مين ده؟"),
                                             filetypes=[(tr("Photos", "صور"),
-                                                        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),
+                                                        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.heic *.heif"),
                                                        (tr("All files", "كل الملفات"), "*.*")])
         if files:
             self.who_add([Path(f) for f in files])

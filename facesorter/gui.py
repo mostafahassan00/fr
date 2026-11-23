@@ -39,9 +39,9 @@ from .library import _ROOT, LIBRARY_DIR, Library, LockedError, MultipleLibraries
 from .perf import LEVELS, Throttle, psutil, speed_label
 from .session import (MODES, build_review, discard_session, find_people, identify, mode_label, pending_session,
                       save_review, scan, stage_label)
-from .ui_kit import (C, LEVEL_COLORS, VERDICT_COLORS, Card, Flow, Fonts, Grid, ScrollFrame, SearchBox, Tip,
-                     WrapLabel, anchor, app_icon, chip, choose, end, fit_window, justify, layout_problems, menu_button,
-                     photo_from_array, round_thumb, shorten_middle, start, style_tk, theme)
+from .ui_kit import (C, LEVEL_COLORS, VERDICT_COLORS, Card, ErrorGate, Flow, Fonts, Grid, ScrollFrame, SearchBox,
+                     Tip, WrapLabel, anchor, app_icon, chip, choose, end, fit_window, justify, layout_problems,
+                     menu_button, photo_from_array, round_thumb, shorten_middle, start, style_tk, theme)
 
 try:  # drag and drop of files onto the window
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -479,6 +479,7 @@ class App:
         if scale:
             self.root.tk.call("tk", "scaling", float(scale) * 96 / 72)
         self.zoom = float(self.root.tk.call("tk", "scaling")) / (96 / 72)
+        self.errors = ErrorGate()
         self.root.report_callback_exception = self.on_error
         try:
             self.settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
@@ -2181,8 +2182,16 @@ class App:
     def on_error(self, exc, val, tb) -> None:
         text = "".join(traceback.format_exception(exc, val, tb))
         log_error("window", text)
-        messagebox.showerror("Face Sorter", tr(f"Something went wrong:\n{val}\n\nDetails were saved in\n{ERRORS}",
-                                               f"حصلت مشكلة:\n{val}\n\nالتفاصيل اتحفظت في\n{ERRORS}"))
+        key = f"{exc.__name__}: {val}"
+        if not self.errors.allow(key):  # the same problem again: written down, not shown again
+            return
+        self.errors.showing = True
+        try:
+            messagebox.showerror("Face Sorter", tr(
+                f"Something went wrong:\n{val}\n\nDetails were saved in\n{ERRORS}",
+                f"حصلت مشكلة:\n{val}\n\nالتفاصيل اتحفظت في\n{ERRORS}"))
+        finally:
+            self.errors.showing = False
 
     # ================================================================ plumbing
     def log(self, text: str) -> None:

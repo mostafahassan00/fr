@@ -15,7 +15,9 @@ Arabic is laid out from the right: start() is "right" in Arabic and "left" in En
 from __future__ import annotations
 
 import base64
+import time
 import tkinter as tk
+import weakref
 import tkinter.font as tkfont
 from tkinter import ttk
 
@@ -385,7 +387,12 @@ class Card(tk.Frame):
 
 
 class ScrollFrame(ttk.Frame):
-    """A page that scrolls when its content is taller than the window. Put things in `.inner`."""
+    """A page that scrolls when its content is taller than the window. Put things in `.inner`.
+
+    The mouse wheel is handled once for the whole program (not once per page): the handler only
+    talks to pages that still exist, and ignores Tk's own windows (like a combobox's open list).
+    """
+    _live: "weakref.WeakSet[ScrollFrame]" = weakref.WeakSet()
 
     def __init__(self, parent, style: str = "Page.TFrame"):
         super().__init__(parent, style=style)
@@ -397,8 +404,22 @@ class ScrollFrame(ttk.Frame):
         self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.win, width=e.width))
         self.canvas.pack(side=start(), fill="both", expand=True)
-        for ev, d in (("<MouseWheel>", None), ("<Button-4>", -1), ("<Button-5>", 1)):
-            self.canvas.bind_all(ev, lambda e, d=d: self._wheel(e, d), add="+")
+        ScrollFrame._live.add(self)
+        root = self._root()
+        if not getattr(root, "_face_sorter_wheel", False):   # once per window, however many pages
+            root._face_sorter_wheel = True
+            for ev, d in (("<MouseWheel>", None), ("<Button-4>", -1), ("<Button-5>", 1)):
+                self.bind_all(ev, lambda e, d=d: ScrollFrame.dispatch(e, d), add="+")
+
+    @staticmethod
+    def dispatch(e, d) -> None:
+        """The wheel turned somewhere: let the page under the mouse scroll."""
+        for sf in list(ScrollFrame._live):
+            try:
+                if sf.winfo_exists() and sf.wheel(e, d):
+                    return
+            except (tk.TclError, KeyError):
+                continue   # a page that was just closed
 
     def _bar_set(self, lo, hi) -> None:
         if float(lo) <= 0.0 and float(hi) >= 1.0:
@@ -407,16 +428,40 @@ class ScrollFrame(ttk.Frame):
             self.bar.pack(side=end(), fill="y", before=self.canvas)
         self.bar.set(lo, hi)
 
-    def _wheel(self, e, d) -> None:
+    def wheel(self, e, d) -> bool:
+        """Scroll if the mouse is over this page. True if the event was for this page."""
         if not self.winfo_ismapped():
-            return
-        w = self.winfo_containing(e.x_root, e.y_root)
+            return False
+        try:
+            w = self.winfo_containing(e.x_root, e.y_root)
+        except (KeyError, tk.TclError):
+            return False   # one of Tk's own windows, e.g. the open list of a combobox: it scrolls itself
         while w is not None and w is not self:
             if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview)) or (isinstance(w, tk.Canvas) and w is not self.canvas):
-                return  # the widget under the mouse scrolls itself
+                return False  # the widget under the mouse scrolls itself
             w = w.master
-        if w is self and self.bar.winfo_ismapped():
+        if w is not self:
+            return False
+        if self.bar.winfo_ismapped():
             self.canvas.yview_scroll(d or (-1 if e.delta > 0 else 1), "units")
+        return True
+
+
+class ErrorGate:
+    """Show an error message once, not once per repeat: the same error within `quiet` seconds, or
+    while its message is still open, is only written to errors.txt."""
+
+    def __init__(self, quiet: float = 60.0):
+        self.quiet = quiet
+        self.last: dict[str, float] = {}
+        self.showing = False
+
+    def allow(self, key: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        if self.showing or now - self.last.get(key, -1e9) < self.quiet:
+            return False
+        self.last[key] = now
+        return True
 
 
 class SearchBox(ttk.Frame):
